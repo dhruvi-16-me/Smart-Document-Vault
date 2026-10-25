@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { listDocuments, searchDocuments } from "../api.ts";
-import { documentTypeLabel, type DocumentRecord, type SearchHit } from "../types.ts";
+import type { DocumentRecord, SearchHit } from "../types.ts";
 
 export function SearchPage({ onOpenDocument }: { onOpenDocument: (id: string) => void }) {
   const [query, setQuery] = useState("");
@@ -102,9 +102,9 @@ export function SearchPage({ onOpenDocument }: { onOpenDocument: (id: string) =>
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
               <h3 className="text-sm font-medium text-stone-900">{group.filename}</h3>
-              {documentTypeLabel(group.documentType) ? (
+              {group.documentLabel ? (
                 <p className="mt-1 text-xs uppercase tracking-wide text-stone-500">
-                  {documentTypeLabel(group.documentType)}
+                  {group.documentLabel}
                 </p>
               ) : null}
             </div>
@@ -138,7 +138,7 @@ function groupResults(results: SearchHit[]) {
   const groups: {
     documentId: string;
     filename: string;
-    documentType: string | null;
+    documentLabel: string | null;
     hits: SearchHit[];
   }[] = [];
   for (const hit of results) {
@@ -149,7 +149,7 @@ function groupResults(results: SearchHit[]) {
       groups.push({
         documentId: hit.document_id,
         filename: hit.filename,
-        documentType: hit.document_type,
+        documentLabel: hit.document_label,
         hits: [hit],
       });
     }

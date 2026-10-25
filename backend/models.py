@@ -14,8 +14,11 @@ class DocumentRecord(BaseModel):
     stored_path: str
     page_count: Optional[int] = None
     document_type: Optional[str] = None
+    document_label: Optional[str] = None
+    document_group: Optional[str] = None
     classification_confidence: Optional[float] = None
     classification_status: Optional[str] = None
+    classification_method: Optional[str] = None
     classification_reasoning: Optional[str] = None
     field_extraction_status: Optional[str] = None
     field_extraction_error: Optional[str] = None
@@ -24,6 +27,10 @@ class DocumentRecord(BaseModel):
     status: str
     error_message: Optional[str] = None
     full_text: Optional[str] = None
+    ocr_confidence: Optional[float] = None
+    low_confidence_pages: List[int] = Field(default_factory=list)
+    notes: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
     created_at: str
 
 
@@ -36,8 +43,51 @@ class DocumentDeleteResponse(BaseModel):
     deleted: bool
 
 
-class DocumentTypeUpdate(BaseModel):
-    document_type: str
+class DocumentUpdate(BaseModel):
+    """Fields left out are not changed. An empty notes string clears the notes."""
+
+    document_type: Optional[str] = None
+    document_group: Optional[str] = None
+    tags: Optional[List[str]] = None
+    notes: Optional[str] = None
+
+    @field_validator("tags")
+    @classmethod
+    def clean_tags(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        tags: List[str] = []
+        for item in value:
+            tag = " ".join(item.split())[:40]
+            if tag and tag.casefold() not in {existing.casefold() for existing in tags}:
+                tags.append(tag)
+        if len(tags) > 20:
+            raise ValueError("A document can have at most 20 tags.")
+        return tags
+
+    @field_validator("notes")
+    @classmethod
+    def check_notes(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and len(value) > 2000:
+            raise ValueError("Notes are too long.")
+        return value
+
+
+class DocumentTypeOption(BaseModel):
+    value: str
+    label: str
+    group: str
+
+
+class DocumentGroupOption(BaseModel):
+    value: str
+    label: str
+
+
+class DocumentOptionsResponse(BaseModel):
+    types: List[DocumentTypeOption]
+    groups: List[DocumentGroupOption]
+    tags: List[str]
 
 
 class DocumentField(BaseModel):
@@ -45,6 +95,11 @@ class DocumentField(BaseModel):
     document_id: str
     field_name: str
     extracted_value: str
+    label: Optional[str] = None
+    kind: Optional[str] = None
+    date_role: Optional[str] = None
+    normalized_value: Optional[str] = None
+    page_number: Optional[int] = None
     verification_status: str
     source_text: Optional[str] = None
 
@@ -134,6 +189,7 @@ class SearchHit(BaseModel):
     document_id: str
     filename: str
     document_type: Optional[str] = None
+    document_label: Optional[str] = None
     chunk_index: int
     page_number: Optional[int] = None
     text: str

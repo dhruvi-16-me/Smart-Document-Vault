@@ -1,4 +1,9 @@
-import { documentTypeLabel, type DocumentRecord } from "../types.ts";
+import {
+  DOCUMENT_STATUS_LABELS,
+  fileTypeLabel,
+  groupLabel,
+  type DocumentRecord,
+} from "../types.ts";
 
 type DocumentCardProps = {
   document: DocumentRecord;
@@ -6,17 +11,6 @@ type DocumentCardProps = {
   onDelete: (id: string) => void;
   deleting: boolean;
 };
-
-const FILE_TYPE_LABELS: Record<string, string> = {
-  "application/pdf": "PDF",
-  "image/png": "PNG",
-  "image/jpeg": "JPEG",
-  "image/webp": "WEBP",
-};
-
-function fileTypeLabel(mediaType: string) {
-  return FILE_TYPE_LABELS[mediaType] ?? mediaType;
-}
 
 function formatUploadedAt(value: string) {
   const date = new Date(`${value.replace(" ", "T")}Z`);
@@ -43,12 +37,28 @@ export function DocumentCard({
           {document.filename}
         </span>
         <span className="mt-1 block text-sm text-stone-500">
-          {fileTypeLabel(document.media_type)} · {document.status}
-          {documentTypeLabel(document.document_type)
-            ? ` · ${documentTypeLabel(document.document_type)}`
-            : ""}{" "}
-          · {formatUploadedAt(document.created_at)}
+          {[
+            document.document_label,
+            groupLabel(document.document_group),
+            fileTypeLabel(document),
+            DOCUMENT_STATUS_LABELS[document.status] ?? document.status,
+            formatUploadedAt(document.created_at),
+          ]
+            .filter(Boolean)
+            .join(" · ")}
         </span>
+        {document.tags.length > 0 ? (
+          <span className="mt-2 flex flex-wrap gap-1.5">
+            {document.tags.map((tag) => (
+              <span
+                key={tag}
+                className="rounded-full bg-stone-100 px-2 py-0.5 text-xs text-stone-700"
+              >
+                {tag}
+              </span>
+            ))}
+          </span>
+        ) : null}
       </button>
       <button
         type="button"

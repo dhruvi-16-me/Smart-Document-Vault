@@ -2,6 +2,7 @@ import sqlite3
 from pathlib import Path
 
 from config import DATA_DIR, DATABASE_PATH
+from services.document_types import KNOWN_TYPES
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
@@ -33,6 +34,8 @@ def init_db() -> None:
             _ensure_field_columns(connection)
             _ensure_profile_table(connection)
             _ensure_index_columns(connection)
+            _ensure_flexible_type_columns(connection)
+            _ensure_page_detail_columns(connection)
     finally:
         connection.close()
 
@@ -141,6 +144,61 @@ def _ensure_index_columns(connection: sqlite3.Connection) -> None:
     }
     if "page_number" not in chunk_columns:
         connection.execute("ALTER TABLE chunks ADD COLUMN page_number INTEGER")
+
+
+def _ensure_flexible_type_columns(connection: sqlite3.Connection) -> None:
+    document_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(documents)").fetchall()
+    }
+    added = False
+    for name in ("document_label", "document_group", "classification_method", "notes"):
+        if name not in document_columns:
+            connection.execute("ALTER TABLE documents ADD COLUMN {} TEXT".format(name))
+            added = True
+    if not added:
+        return
+    # Documents classified before open types existed only have a known type key.
+    for key, (label, group) in KNOWN_TYPES.items():
+        connection.execute(
+            """
+            UPDATE documents SET document_label = ?, document_group = ?
+            WHERE document_type = ? AND document_label IS NULL
+            """,
+            (label, group, key),
+        )
+    connection.execute(
+        """
+        UPDATE documents
+        SET classification_method = CASE classification_status
+            WHEN 'predicted' THEN 'model'
+            WHEN 'verified' THEN 'manual'
+        END
+        WHERE classification_method IS NULL
+        """
+    )
+
+
+def _ensure_page_detail_columns(connection: sqlite3.Connection) -> None:
+    additions = {
+        "documents": (("ocr_confidence", "REAL"), ("low_confidence_pages", "TEXT")),
+        "document_fields": (
+            ("label", "TEXT"),
+            ("kind", "TEXT"),
+            ("date_role", "TEXT"),
+            ("normalized_value", "TEXT"),
+            ("page_number", "INTEGER"),
+        ),
+    }
+    for table, columns in additions.items():
+        existing = {
+            row["name"] for row in connection.execute("PRAGMA table_info({})".format(table)).fetchall()
+        }
+        for name, column_type in columns:
+            if name not in existing:
+                connection.execute(
+                    "ALTER TABLE {} ADD COLUMN {} {}".format(table, name, column_type)
+                )
 
 
 def _documents_id_is_integer(connection: sqlite3.Connection) -> bool:

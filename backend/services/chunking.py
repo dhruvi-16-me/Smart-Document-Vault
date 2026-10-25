@@ -15,7 +15,7 @@ def chunk_overlap() -> int:
 def chunk_text(text: str) -> List[dict]:
     """Split extracted text into overlapping chunks. Empty pieces are dropped."""
     chunks = []
-    for page_number, page_text in _pages(text or ""):
+    for page_number, page_text in split_pages(text or ""):
         for piece in _windows(page_text):
             chunks.append(
                 {
@@ -27,7 +27,8 @@ def chunk_text(text: str) -> List[dict]:
     return chunks
 
 
-def _pages(text: str):
+def split_pages(text: str):
+    """Yield (page number or None, page text) from text with [Page n] markers."""
     matches = list(re.finditer(r"\[Page (\d+)\]", text))
     if not matches:
         yield None, text

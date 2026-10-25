@@ -1,7 +1,5 @@
 import { useState } from "react";
 
-const ACCEPTED_EXTENSIONS = [".pdf", ".png", ".jpg", ".jpeg", ".webp"];
-
 type UploadDropzoneProps = {
   onFileSelected: (file: File) => void;
   onReject?: (message: string) => void;
@@ -17,10 +15,8 @@ function chooseFile(
   if (!file) {
     return;
   }
-  const name = file.name.toLowerCase();
-  const accepted = ACCEPTED_EXTENSIONS.some((extension) => name.endsWith(extension));
-  if (!accepted) {
-    onReject?.("Only PDF, PNG, JPG, and WEBP files can be uploaded.");
+  if (file.size === 0) {
+    onReject?.("This file is empty.");
     return;
   }
   onFileSelected(file);
@@ -60,7 +56,6 @@ export function UploadDropzone({
     >
       <input
         type="file"
-        accept=".pdf,.png,.jpg,.jpeg,.webp,application/pdf,image/png,image/jpeg,image/webp"
         className="sr-only"
         disabled={inactive}
         onChange={(event) => {
@@ -69,10 +64,12 @@ export function UploadDropzone({
         }}
       />
       <span className="block text-sm font-medium text-stone-900">
-        {uploading ? "Uploading…" : "Drop a PDF or image here"}
+        {uploading ? "Uploading…" : "Drop any document here"}
       </span>
       <span className="mt-1 block text-sm text-stone-500">
-        {uploading ? "Keep this page open" : "PDF, PNG, JPG, or WEBP"}
+        {uploading
+          ? "Keep this page open"
+          : "PDFs, photos, scans, Word and text files are read. Other files are stored as they are."}
       </span>
     </label>
   );

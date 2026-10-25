@@ -1,23 +1,55 @@
+import mimetypes
+import re
 import shutil
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, NamedTuple, Optional
 
 from config import DATA_DIR
 
 DOCUMENTS_DIR = DATA_DIR / "documents"
 CHUNK_SIZE = 1024 * 1024
+HEADER_SIZE = 16
 
-ALLOWED_EXTENSIONS = {
+DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+# Formats whose text the app can read. Any other file is still stored, just not read.
+READABLE_FORMATS = {
     ".pdf": "application/pdf",
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".docx": DOCX_MEDIA_TYPE,
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".csv": "text/csv",
 }
 
-CONTENT_TYPE_ALIASES = {
-    "image/jpg": "image/jpeg",
+FORMAT_NAMES = {
+    ".pdf": "PDF",
+    ".png": "PNG",
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".webp": "WEBP",
+    ".heic": "HEIC",
+    ".heif": "HEIF",
+    ".tif": "TIFF",
+    ".tiff": "TIFF",
+    ".docx": "Word",
 }
+
+_HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1"}
+
+
+class StoredUpload(NamedTuple):
+    stored_path: str
+    media_type: str
+    # Why a file in a readable format will not be read, if it will not.
+    note: Optional[str]
 
 
 def safe_original_name(filename: str) -> str:
@@ -31,38 +63,33 @@ def safe_original_name(filename: str) -> str:
 
 
 def extension_for(filename: str) -> str:
+    """Return a safe lowercase extension, or an empty string when there is none."""
     suffix = Path(filename).suffix.lower()
-    if suffix not in ALLOWED_EXTENSIONS:
-        raise ValueError("Only PDF, PNG, JPG, and WEBP files are supported.")
-    return suffix
+    return suffix if re.fullmatch(r"\.[a-z0-9]{1,10}", suffix) else ""
 
 
-def media_type_for(suffix: str, content_type: str) -> str:
-    expected = ALLOWED_EXTENSIONS[suffix]
-    normalized = content_type.split(";", 1)[0].strip().lower()
-    if normalized in {"", "application/octet-stream"}:
-        return expected
-    normalized = CONTENT_TYPE_ALIASES.get(normalized, normalized)
-    if normalized != expected:
-        raise ValueError("The file type does not match its extension.")
-    return expected
+def is_readable(media_type: str) -> bool:
+    return media_type in READABLE_FORMATS.values()
 
 
-def save_upload(document_id: str, suffix: str, source: BinaryIO) -> str:
-    """Copy an upload stream into documents/<id>.<extension> without changing the bytes."""
-    if suffix not in ALLOWED_EXTENSIONS:
-        raise ValueError("Only PDF, PNG, JPG, and WEBP files are supported.")
+def save_upload(document_id: str, filename: str, source: BinaryIO) -> StoredUpload:
+    """Copy an upload stream into documents/<id><extension> without changing the bytes.
+
+    Any file is accepted. The stored format comes from the file's bytes when they are
+    recognised, so a PNG named .jpg is still read as an image.
+    """
     if not document_id or document_id in {".", ".."} or "/" in document_id or "\\" in document_id:
         raise ValueError("Invalid document id.")
+
+    header = source.read(HEADER_SIZE)
+    if not header:
+        raise ValueError("The file is empty.")
+    suffix, media_type, note = _storage_format(filename, header)
 
     documents_root = DOCUMENTS_DIR.resolve()
     destination = (documents_root / f"{document_id}{suffix}").resolve()
     if documents_root not in destination.parents:
         raise ValueError("Invalid storage path.")
-
-    header = source.read(16)
-    if not _matches_signature(suffix, header):
-        raise ValueError("The file is not a valid PDF or image.")
 
     documents_root.mkdir(parents=True, exist_ok=True)
     try:
@@ -73,7 +100,7 @@ def save_upload(document_id: str, suffix: str, source: BinaryIO) -> str:
         destination.unlink(missing_ok=True)
         raise
 
-    return f"documents/{document_id}{suffix}"
+    return StoredUpload(f"documents/{document_id}{suffix}", media_type, note)
 
 
 def delete_stored_file(stored_path: str) -> None:
@@ -94,6 +121,35 @@ def resolve_stored_path(stored_path: str) -> Path:
     return target
 
 
+def _storage_format(filename: str, header: bytes):
+    suffix = extension_for(filename)
+    sniffed = _sniff_suffix(header)
+    if suffix in FORMAT_NAMES:
+        if _matches_signature(suffix, header):
+            return suffix, READABLE_FORMATS[suffix], None
+        if sniffed:
+            return sniffed, READABLE_FORMATS[sniffed], None
+        note = "This file is named .{} but its contents are not a valid {} file, so it was stored without reading.".format(
+            suffix[1:], FORMAT_NAMES[suffix]
+        )
+        return suffix, "application/octet-stream", note
+    if sniffed:
+        return sniffed, READABLE_FORMATS[sniffed], None
+    if suffix in READABLE_FORMATS:
+        return suffix, READABLE_FORMATS[suffix], None
+    guessed = mimetypes.guess_type("file" + suffix)[0] if suffix else None
+    return suffix, guessed or "application/octet-stream", None
+
+
+def _sniff_suffix(header: bytes) -> Optional[str]:
+    """Recognise readable binary formats by their first bytes. Word files are zip
+    archives like many other formats, so they are only trusted by extension."""
+    for suffix in (".pdf", ".png", ".jpg", ".webp", ".heic", ".tiff"):
+        if _matches_signature(suffix, header):
+            return suffix
+    return None
+
+
 def _matches_signature(suffix: str, header: bytes) -> bool:
     if suffix == ".pdf":
         return header.startswith(b"%PDF")
@@ -103,4 +159,10 @@ def _matches_signature(suffix: str, header: bytes) -> bool:
         return header.startswith(b"\xff\xd8\xff")
     if suffix == ".webp":
         return len(header) >= 12 and header.startswith(b"RIFF") and header[8:12] == b"WEBP"
+    if suffix in {".heic", ".heif"}:
+        return len(header) >= 12 and header[4:8] == b"ftyp" and header[8:12] in _HEIF_BRANDS
+    if suffix in {".tif", ".tiff"}:
+        return header.startswith((b"II*\x00", b"MM\x00*"))
+    if suffix == ".docx":
+        return header.startswith(b"PK\x03\x04")
     return False

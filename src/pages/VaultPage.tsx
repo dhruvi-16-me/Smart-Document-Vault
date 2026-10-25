@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { deleteDocument, listDocuments, uploadDocument } from "../api.ts";
 import { DocumentCard } from "../components/DocumentCard.tsx";
 import { UploadDropzone } from "../components/UploadDropzone.tsx";
-import type { DocumentRecord } from "../types.ts";
+import { groupLabel, type DocumentRecord } from "../types.ts";
 
 type VaultPageProps = {
   onOpenDocument: (id: string) => void;
@@ -15,6 +15,8 @@ export function VaultPage({ onOpenDocument, onDocumentDeleted }: VaultPageProps)
   const [uploading, setUploading] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [filter, setFilter] = useState("");
+  const visibleDocuments = documents.filter((document) => matchesFilter(document, filter));
 
   const refreshDocuments = useCallback(async () => {
     const response = await listDocuments();
@@ -97,7 +99,7 @@ export function VaultPage({ onOpenDocument, onDocumentDeleted }: VaultPageProps)
       <div>
         <h2 className="text-2xl font-semibold text-stone-900">Vault</h2>
         <p className="mt-1 text-sm text-stone-600">
-          PDFs and images are stored on this computer.
+          Every file stays on this computer.
         </p>
       </div>
       <UploadDropzone
@@ -110,8 +112,21 @@ export function VaultPage({ onOpenDocument, onDocumentDeleted }: VaultPageProps)
       {!loading && documents.length === 0 ? (
         <p className="text-sm text-stone-500">No documents stored yet.</p>
       ) : null}
+      {documents.length > 0 ? (
+        <input
+          type="search"
+          value={filter}
+          onChange={(event) => setFilter(event.target.value)}
+          placeholder="Filter by name, type, group, tag, or notes"
+          aria-label="Filter documents"
+          className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm"
+        />
+      ) : null}
+      {documents.length > 0 && visibleDocuments.length === 0 ? (
+        <p className="text-sm text-stone-500">No documents match this filter.</p>
+      ) : null}
       <div className="grid gap-3">
-        {documents.map((document) => (
+        {visibleDocuments.map((document) => (
           <DocumentCard
             key={document.id}
             document={document}
@@ -123,4 +138,22 @@ export function VaultPage({ onOpenDocument, onDocumentDeleted }: VaultPageProps)
       </div>
     </section>
   );
+}
+
+function matchesFilter(document: DocumentRecord, filter: string) {
+  const words = filter.toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length === 0) {
+    return true;
+  }
+  const haystack = [
+    document.filename,
+    document.document_label,
+    groupLabel(document.document_group),
+    document.notes,
+    ...document.tags,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return words.every((word) => haystack.includes(word));
 }

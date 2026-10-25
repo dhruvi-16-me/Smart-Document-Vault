@@ -2,27 +2,28 @@ import { useEffect, useState } from "react";
 import {
   getDocument,
   getDocumentFields,
+  getDocumentOptions,
   retryFieldExtraction,
+  updateDocument,
   updateDocumentField,
-  updateDocumentType,
 } from "../api.ts";
-import type { DocumentField, DocumentFieldsResponse } from "../types.ts";
-import { DOCUMENT_TYPES, documentTypeLabel, type DocumentRecord } from "../types.ts";
+import type {
+  DocumentField,
+  DocumentFieldsResponse,
+  DocumentOptions,
+  DocumentUpdate,
+} from "../types.ts";
+import {
+  DOCUMENT_STATUS_LABELS,
+  READABLE_FORMATS_TEXT,
+  fileTypeLabel,
+  groupLabel,
+  type DocumentRecord,
+} from "../types.ts";
 
 type DocumentPageProps = {
   documentId: string | null;
 };
-
-const FILE_TYPE_LABELS: Record<string, string> = {
-  "application/pdf": "PDF",
-  "image/png": "PNG",
-  "image/jpeg": "JPEG",
-  "image/webp": "WEBP",
-};
-
-function fileTypeLabel(mediaType: string) {
-  return FILE_TYPE_LABELS[mediaType] ?? mediaType;
-}
 
 function isPending(document: DocumentRecord) {
   return document.status === "uploaded" || document.status === "processing";
@@ -89,7 +90,7 @@ function DocumentDetail({ documentId }: { documentId: string }) {
           {document?.filename ?? "Document"}
         </h2>
         <p className="mt-1 text-sm text-stone-600">
-          Text from PDFs and images appears here.
+          Type, tags, notes, extracted text, and fields for this document.
         </p>
       </div>
       {error ? <p className="text-sm text-red-700">{error}</p> : null}
@@ -98,16 +99,18 @@ function DocumentDetail({ documentId }: { documentId: string }) {
       ) : null}
       {document ? (
         <>
-          <dl className="grid gap-4 rounded-xl border border-stone-200 bg-white p-4 sm:grid-cols-3">
+          <dl className="grid gap-4 rounded-xl border border-stone-200 bg-white p-4 sm:grid-cols-4">
             <div>
               <dt className="text-xs uppercase tracking-wide text-stone-500">File type</dt>
               <dd className="mt-1 text-sm text-stone-900">
-                {fileTypeLabel(document.media_type)}
+                {fileTypeLabel(document)}
               </dd>
             </div>
             <div>
               <dt className="text-xs uppercase tracking-wide text-stone-500">Status</dt>
-              <dd className="mt-1 text-sm text-stone-900">{document.status}</dd>
+              <dd className="mt-1 text-sm text-stone-900">
+                {DOCUMENT_STATUS_LABELS[document.status] ?? document.status}
+              </dd>
             </div>
             <div>
               <dt className="text-xs uppercase tracking-wide text-stone-500">Page count</dt>
@@ -115,10 +118,30 @@ function DocumentDetail({ documentId }: { documentId: string }) {
                 {document.page_count === null ? "—" : document.page_count}
               </dd>
             </div>
+            <div>
+              <dt className="text-xs uppercase tracking-wide text-stone-500">OCR confidence</dt>
+              <dd className="mt-1 text-sm text-stone-900">
+                {document.ocr_confidence === null ? "—" : `${Math.round(document.ocr_confidence)}%`}
+              </dd>
+            </div>
           </dl>
-          {!isPending(document) && document.status !== "failed" ? (
-            <ClassificationPanel
-              key={`${document.id}-${document.classification_status}-${document.document_type}`}
+          {document.low_confidence_pages.length > 0 ? (
+            <p className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+              Text was hard to read on {pageList(document.low_confidence_pages)}. Check values from{" "}
+              {document.low_confidence_pages.length === 1 ? "that page" : "those pages"} against the
+              original.
+            </p>
+          ) : null}
+          {!isPending(document) ? (
+            <DetailsPanel
+              key={[
+                document.id,
+                document.document_type,
+                document.document_label,
+                document.document_group,
+                document.notes,
+                ...document.tags,
+              ].join("|")}
               document={document}
               onUpdated={setDocument}
             />
@@ -141,33 +164,86 @@ const STATUS_LABELS: Record<string, string> = {
   predicted: "Predicted",
   needs_review: "Needs review",
   failed: "Classification failed",
-  verified: "Verified manually",
+  verified: "Confirmed by you",
 };
 
-function ClassificationPanel({
+const METHOD_LABELS: Record<string, string> = {
+  rules: "Pattern rules",
+  model: "AI model",
+  manual: "You",
+};
+
+function parseTags(value: string) {
+  return value
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+}
+
+function DetailsPanel({
   document,
   onUpdated,
 }: {
   document: DocumentRecord;
   onUpdated: (document: DocumentRecord) => void;
 }) {
+  const [options, setOptions] = useState<DocumentOptions | null>(null);
+  const [typeLabel, setTypeLabel] = useState(document.document_label ?? "");
+  const [group, setGroup] = useState(document.document_group ?? "");
+  const [tags, setTags] = useState(document.tags.join(", "));
+  const [notes, setNotes] = useState(document.notes ?? "");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const typeLabel = documentTypeLabel(document.document_type);
 
-  async function handleChange(nextType: string) {
-    if (!nextType || nextType === document.document_type) {
-      return;
+  useEffect(() => {
+    let active = true;
+    getDocumentOptions()
+      .then((response) => {
+        if (active) {
+          setOptions(response);
+        }
+      })
+      .catch(() => {
+        // Suggestions are optional; the form works without them.
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  function changeType(value: string) {
+    setTypeLabel(value);
+    const match = options?.types.find(
+      (option) => option.label.toLowerCase() === value.trim().toLowerCase(),
+    );
+    if (match) {
+      setGroup(match.group);
     }
+  }
+
+  const update: DocumentUpdate = {};
+  if (typeLabel.trim() && typeLabel.trim() !== (document.document_label ?? "")) {
+    update.document_type = typeLabel.trim();
+  }
+  if (group && group !== (document.document_group ?? "")) {
+    update.document_group = group;
+  }
+  if (parseTags(tags).join("\n") !== document.tags.join("\n")) {
+    update.tags = parseTags(tags);
+  }
+  if (notes.trim() !== (document.notes ?? "")) {
+    update.notes = notes;
+  }
+  const changed = Object.keys(update).length > 0;
+
+  async function save() {
     setSaving(true);
     setSaveError(null);
     try {
-      onUpdated(await updateDocumentType(document.id, nextType));
+      onUpdated(await updateDocument(document.id, update));
     } catch (saveFailure) {
       setSaveError(
-        saveFailure instanceof Error
-          ? saveFailure.message
-          : "Could not update the document type.",
+        saveFailure instanceof Error ? saveFailure.message : "Could not save these details.",
       );
     } finally {
       setSaving(false);
@@ -176,27 +252,31 @@ function ClassificationPanel({
 
   return (
     <section className="rounded-xl border border-stone-200 bg-white p-4">
-      <h3 className="text-sm font-medium text-stone-900">Classification</h3>
-      <dl className="mt-3 grid gap-4 border-t border-stone-200 pt-3 sm:grid-cols-3">
+      <h3 className="text-sm font-medium text-stone-900">Details</h3>
+      <dl className="mt-3 grid gap-4 border-t border-stone-200 pt-3 sm:grid-cols-4">
         <div>
           <dt className="text-xs uppercase tracking-wide text-stone-500">Document type</dt>
-          <dd className="mt-1 text-sm text-stone-900">{typeLabel ?? "—"}</dd>
+          <dd className="mt-1 text-sm text-stone-900">{document.document_label ?? "—"}</dd>
         </div>
         <div>
-          <dt className="text-xs uppercase tracking-wide text-stone-500">Confidence</dt>
+          <dt className="text-xs uppercase tracking-wide text-stone-500">Group</dt>
           <dd className="mt-1 text-sm text-stone-900">
-            {document.classification_confidence === null
-              ? "—"
-              : document.classification_confidence.toFixed(2)}
+            {groupLabel(document.document_group) ?? "—"}
           </dd>
-          {document.classification_status === "predicted" ? (
-            <p className="mt-1 text-xs text-stone-500">Uncalibrated model estimate</p>
+        </div>
+        <div>
+          <dt className="text-xs uppercase tracking-wide text-stone-500">Decided by</dt>
+          <dd className="mt-1 text-sm text-stone-900">
+            {METHOD_LABELS[document.classification_method ?? ""] ?? "—"}
+          </dd>
+          {document.classification_confidence !== null ? (
+            <p className="mt-1 text-xs text-stone-500">
+              Confidence {document.classification_confidence.toFixed(2)} (uncalibrated)
+            </p>
           ) : null}
         </div>
         <div>
-          <dt className="text-xs uppercase tracking-wide text-stone-500">
-            Classification status
-          </dt>
+          <dt className="text-xs uppercase tracking-wide text-stone-500">Status</dt>
           <dd className="mt-1 text-sm text-stone-900">
             {STATUS_LABELS[document.classification_status ?? ""] ?? "—"}
           </dd>
@@ -205,33 +285,125 @@ function ClassificationPanel({
       {document.classification_reasoning ? (
         <p className="mt-3 text-sm text-stone-700">{document.classification_reasoning}</p>
       ) : null}
-      <label className="mt-4 grid gap-1 text-sm">
-        <span className="font-medium text-stone-800">Correct the type</span>
-        <select
-          value={document.document_type ?? ""}
-          disabled={saving}
-          onChange={(event) => {
-            void handleChange(event.target.value);
-          }}
-          className="rounded-lg border border-stone-300 bg-white px-3 py-2"
-        >
-          <option value="" disabled>
-            Choose a type
-          </option>
-          {DOCUMENT_TYPES.map(([value, label]) => (
-            <option key={value} value={value}>
-              {label}
+      <form
+        className="mt-4 grid gap-3 border-t border-stone-200 pt-4 sm:grid-cols-2"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void save();
+        }}
+      >
+        <label className="grid gap-1 text-sm">
+          <span className="font-medium text-stone-800">Document type</span>
+          <input
+            value={typeLabel}
+            list="document-type-options"
+            onChange={(event) => changeType(event.target.value)}
+            placeholder="For example: Rent agreement"
+            className="rounded-lg border border-stone-300 px-3 py-2"
+          />
+          <datalist id="document-type-options">
+            {options?.types.map((option) => (
+              <option key={option.value} value={option.label} />
+            ))}
+          </datalist>
+        </label>
+        <label className="grid gap-1 text-sm">
+          <span className="font-medium text-stone-800">Group</span>
+          <select
+            value={group}
+            onChange={(event) => setGroup(event.target.value)}
+            className="rounded-lg border border-stone-300 bg-white px-3 py-2"
+          >
+            <option value="" disabled>
+              Choose a group
             </option>
-          ))}
-        </select>
-      </label>
+            {(options?.groups ?? []).map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="grid gap-1 text-sm sm:col-span-2">
+          <span className="font-medium text-stone-800">Tags</span>
+          <input
+            value={tags}
+            onChange={(event) => setTags(event.target.value)}
+            placeholder="Separate tags with commas"
+            className="rounded-lg border border-stone-300 px-3 py-2"
+          />
+          {options && options.tags.length > 0 ? (
+            <span className="text-xs text-stone-500">In use: {options.tags.join(", ")}</span>
+          ) : null}
+        </label>
+        <label className="grid gap-1 text-sm sm:col-span-2">
+          <span className="font-medium text-stone-800">Notes</span>
+          <textarea
+            value={notes}
+            onChange={(event) => setNotes(event.target.value)}
+            rows={3}
+            maxLength={2000}
+            className="rounded-lg border border-stone-300 px-3 py-2"
+          />
+        </label>
+        <div className="flex items-center gap-3 sm:col-span-2">
+          <button
+            type="submit"
+            disabled={!changed || saving}
+            className="rounded-lg bg-stone-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+          >
+            {saving ? "Saving…" : "Save details"}
+          </button>
+          {update.document_type && document.status === "ready" ? (
+            <span className="text-xs text-stone-500">
+              Changing the type extracts fields again.
+            </span>
+          ) : null}
+        </div>
+      </form>
       {saveError ? <p className="mt-2 text-sm text-red-700">{saveError}</p> : null}
     </section>
   );
 }
 
+const KIND_LABELS: Record<string, string> = {
+  text: "Text",
+  name: "Name",
+  date: "Date",
+  id_number: "ID number",
+  amount: "Amount",
+  number: "Number",
+  percentage: "Percentage",
+  address: "Address",
+  phone: "Phone",
+  email: "Email",
+};
+
+function fieldDetails(field: DocumentField) {
+  return [
+    field.kind ? (KIND_LABELS[field.kind] ?? field.kind) : null,
+    field.date_role,
+    field.normalized_value,
+    field.page_number === null ? null : `Page ${field.page_number}`,
+  ].filter((item): item is string => Boolean(item));
+}
+
+function pageList(pages: number[]) {
+  return pages.length === 1 ? `page ${pages[0]}` : `pages ${pages.join(", ")}`;
+}
+
+const FIELD_LABELS: Record<string, string> = {
+  fathers_name: "Father's Name",
+  mothers_name: "Mother's Name",
+  cgpa: "CGPA",
+  pan_number: "PAN Number",
+};
+
 function fieldLabel(name: string) {
-  return name.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+  return (
+    FIELD_LABELS[name] ??
+    name.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase())
+  );
 }
 
 function displayValue(value: string) {
@@ -302,14 +474,30 @@ function ExtractedFields({
   }
 
   const status = document.field_extraction_status;
-  const stored = new Map((payload?.fields ?? []).map((field) => [field.field_name, field]));
+  const fields = payload?.fields ?? [];
+  const stored = new Map(fields.map((field) => [field.field_name, field]));
   const names = payload?.expected_fields ?? [];
+  // Template fields first (missing ones included), then any other labelled values.
+  const rows: (DocumentField | string)[] = [
+    ...names.map((name) => stored.get(name) ?? name),
+    ...fields.filter((field) => !names.includes(field.field_name)),
+  ];
+  const updateField = (updated: DocumentField) => {
+    setPayload((current) =>
+      current
+        ? {
+            ...current,
+            fields: current.fields.map((item) => (item.id === updated.id ? updated : item)),
+          }
+        : current,
+    );
+  };
 
   return (
     <section className="rounded-xl border border-stone-200 bg-white p-4">
       <div className="flex items-center justify-between gap-3">
         <h3 className="text-sm font-medium text-stone-900">Extracted Fields</h3>
-        {status === "failed" ? (
+        {status === "failed" || status === "completed" ? (
           <button
             type="button"
             disabled={retrying}
@@ -318,7 +506,7 @@ function ExtractedFields({
             }}
             className="rounded-lg border border-stone-300 px-3 py-1 text-sm text-stone-800"
           >
-            {retrying ? "Retrying…" : "Retry extraction"}
+            {retrying ? "Starting…" : status === "failed" ? "Retry extraction" : "Extract again"}
           </button>
         ) : null}
       </div>
@@ -338,47 +526,44 @@ function ExtractedFields({
           {document.field_extraction_error || "Field extraction failed."}
         </p>
       ) : null}
-      {status === "completed" && names.length > 0 ? (
+      {status === "completed" && rows.length === 0 ? (
+        <p className="mt-3 text-sm text-stone-600">No labelled values were found.</p>
+      ) : null}
+      {status === "completed" && rows.length > 0 ? (
         <div className="mt-3 overflow-x-auto border-t border-stone-200 pt-3">
           <table className="w-full text-left text-sm">
             <thead>
               <tr className="text-xs uppercase tracking-wide text-stone-500">
                 <th className="py-2 pr-3 font-medium">Field</th>
                 <th className="py-2 pr-3 font-medium">Value</th>
+                <th className="py-2 pr-3 font-medium">Details</th>
                 <th className="py-2 pr-3 font-medium">Status</th>
                 <th className="py-2 font-medium">Source</th>
               </tr>
             </thead>
             <tbody>
-              {names.map((name) => {
-                const field = stored.get(name);
-                return field ? (
-                  <FieldRow
-                    key={field.id}
-                    documentId={document.id}
-                    field={field}
-                    onUpdated={(updated) => {
-                      setPayload((current) =>
-                        current
-                          ? {
-                              ...current,
-                              fields: current.fields.map((item) =>
-                                item.id === updated.id ? updated : item,
-                              ),
-                            }
-                          : current,
-                      );
-                    }}
-                  />
-                ) : (
-                  <tr key={name} className="border-t border-stone-100">
-                    <td className="py-2 pr-3 text-stone-800">{fieldLabel(name)}</td>
+              {rows.map((row) =>
+                typeof row === "string" ? (
+                  <tr key={row} className="border-t border-stone-100">
+                    <td className="py-2 pr-3 text-stone-800">{fieldLabel(row)}</td>
                     <td className="py-2 pr-3 text-stone-400">Missing</td>
+                    <td className="py-2 pr-3 text-stone-400">—</td>
                     <td className="py-2 pr-3 text-stone-400">Not extracted</td>
                     <td className="py-2 text-stone-400">—</td>
                   </tr>
-                );
-              })}
+                ) : (
+                  <FieldRow
+                    key={row.id}
+                    documentId={document.id}
+                    field={row}
+                    lowConfidence={
+                      row.page_number !== null &&
+                      document.low_confidence_pages.includes(row.page_number)
+                    }
+                    onUpdated={updateField}
+                  />
+                ),
+              )}
             </tbody>
           </table>
         </div>
@@ -390,10 +575,12 @@ function ExtractedFields({
 function FieldRow({
   documentId,
   field,
+  lowConfidence,
   onUpdated,
 }: {
   documentId: string;
   field: DocumentField;
+  lowConfidence: boolean;
   onUpdated: (field: DocumentField) => void;
 }) {
   const [value, setValue] = useState(displayValue(field.extracted_value));
@@ -415,7 +602,7 @@ function FieldRow({
 
   return (
     <tr className="border-t border-stone-100 align-top">
-      <td className="py-2 pr-3 text-stone-800">{fieldLabel(field.field_name)}</td>
+      <td className="py-2 pr-3 text-stone-800">{field.label ?? fieldLabel(field.field_name)}</td>
       <td className="py-2 pr-3">
         <input
           value={value}
@@ -433,6 +620,12 @@ function FieldRow({
           {saving ? "Saving…" : "Save and verify"}
         </button>
         {error ? <p className="mt-1 text-xs text-red-700">{error}</p> : null}
+      </td>
+      <td className="py-2 pr-3 text-xs text-stone-600">
+        {fieldDetails(field).join(" · ") || "—"}
+        {lowConfidence ? (
+          <span className="mt-1 block text-amber-800">Hard-to-read page</span>
+        ) : null}
       </td>
       <td className="py-2 pr-3 text-stone-700">
         {verified ? "Verified by you" : "AI extracted"}
@@ -452,6 +645,20 @@ function ExtractedText({ document }: { document: DocumentRecord }) {
       <p className="text-sm text-red-700">
         {document.error_message || "Could not read text from this document."}
       </p>
+    );
+  }
+
+  if (document.status === "stored") {
+    return (
+      <section className="rounded-xl border border-stone-200 bg-white p-4 text-sm text-stone-700">
+        <p>
+          {document.error_message ||
+            "This file is stored in the vault, but its contents cannot be read."}
+        </p>
+        <p className="mt-2 text-stone-500">
+          Text is read from {READABLE_FORMATS_TEXT}. You can still set a type, tags, and notes.
+        </p>
+      </section>
     );
   }
 

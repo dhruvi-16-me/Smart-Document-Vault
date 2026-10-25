@@ -92,13 +92,16 @@ def profile_value(field_name: str, value: str) -> str:
     return cleaned
 
 
-def unambiguous_iso_date(value: str) -> Optional[str]:
-    """Return YYYY-MM-DD only when the calendar date has one interpretation."""
+def unambiguous_iso_date(value: str, day_first: bool = False) -> Optional[str]:
+    """Return YYYY-MM-DD only when the calendar date has one interpretation.
+
+    With day_first, a numeric date like 05/04/2026 is read as 5 April, as Indian documents write it.
+    """
     text = value.strip()
     iso = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", text)
     if iso:
         return _iso(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
-    numeric = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", text)
+    numeric = re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})", text)
     if numeric:
         first = int(numeric.group(1))
         second = int(numeric.group(2))
@@ -107,6 +110,8 @@ def unambiguous_iso_date(value: str) -> Optional[str]:
             return _iso(year, second, first)
         if second > 12 and 1 <= first <= 12:
             return _iso(year, first, second)
+        if day_first:
+            return _iso(year, second, first)
         return None
     named = re.fullmatch(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", text)
     if named and named.group(2).lower() in _MONTHS:

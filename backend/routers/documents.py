@@ -1,6 +1,7 @@
-import re
+import json
 import sqlite3
 import uuid
+from typing import Dict, List
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 
@@ -9,20 +10,21 @@ from models import (
     DocumentDeleteResponse,
     DocumentField,
     DocumentFieldsResponse,
+    DocumentGroupOption,
     DocumentListResponse,
+    DocumentOptionsResponse,
     DocumentRecord,
-    DocumentTypeUpdate,
+    DocumentTypeOption,
+    DocumentUpdate,
     FieldValueUpdate,
 )
-from services.classify import DOCUMENT_TYPES, classify_document
-from services.fields import FIELD_SCHEMAS, extract_fields
-from services.extract import extract_pdf_text
-from services.ocr import ocr_image, ocr_pdf
+from services.document_types import DOCUMENT_GROUPS, KNOWN_TYPES, normalize_group, resolve_type
+from services.fields import FIELD_SCHEMAS
+from services.pipeline import can_extract, process_document, run_field_extraction
+from services.profile import unambiguous_iso_date
 from services.storage import (
     delete_stored_file,
-    extension_for,
-    media_type_for,
-    resolve_stored_path,
+    is_readable,
     safe_original_name,
     save_upload,
 )
@@ -30,7 +32,7 @@ from services.storage import (
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 
-def document_from_row(row: sqlite3.Row) -> DocumentRecord:
+def document_from_row(row: sqlite3.Row, tags: List[str]) -> DocumentRecord:
     return DocumentRecord(
         id=row["id"],
         filename=row["filename"],
@@ -38,8 +40,11 @@ def document_from_row(row: sqlite3.Row) -> DocumentRecord:
         stored_path=row["stored_path"],
         page_count=row["page_count"],
         document_type=row["document_type"],
+        document_label=row["document_label"],
+        document_group=row["document_group"],
         classification_confidence=row["classification_confidence"],
         classification_status=row["classification_status"],
+        classification_method=row["classification_method"],
         classification_reasoning=row["classification_reasoning"],
         field_extraction_status=row["field_extraction_status"],
         field_extraction_error=row["field_extraction_error"],
@@ -48,7 +53,27 @@ def document_from_row(row: sqlite3.Row) -> DocumentRecord:
         status=row["status"],
         error_message=row["error_message"],
         full_text=row["full_text"],
+        ocr_confidence=row["ocr_confidence"],
+        low_confidence_pages=json.loads(row["low_confidence_pages"] or "[]"),
+        notes=row["notes"],
+        tags=tags,
         created_at=row["created_at"],
+    )
+
+
+def field_from_row(row: sqlite3.Row) -> DocumentField:
+    return DocumentField(
+        id=row["id"],
+        document_id=row["document_id"],
+        field_name=row["name"],
+        extracted_value=row["value"],
+        label=row["label"],
+        kind=row["kind"],
+        date_role=row["date_role"],
+        normalized_value=row["normalized_value"],
+        page_number=row["page_number"],
+        verification_status=row["verification_status"] or "extracted",
+        source_text=row["source_text"],
     )
 
 
@@ -62,6 +87,24 @@ def fetch_document(connection: sqlite3.Connection, document_id: str) -> sqlite3.
     return row
 
 
+def load_record(connection: sqlite3.Connection, document_id: str) -> DocumentRecord:
+    row = fetch_document(connection, document_id)
+    tags = connection.execute(
+        "SELECT tag FROM document_tags WHERE document_id = ? ORDER BY tag COLLATE NOCASE",
+        (document_id,),
+    ).fetchall()
+    return document_from_row(row, [tag["tag"] for tag in tags])
+
+
+def _tags_by_document(connection: sqlite3.Connection) -> Dict[str, List[str]]:
+    tags: Dict[str, List[str]] = {}
+    for row in connection.execute(
+        "SELECT document_id, tag FROM document_tags ORDER BY tag COLLATE NOCASE"
+    ).fetchall():
+        tags.setdefault(row["document_id"], []).append(row["tag"])
+    return tags
+
+
 @router.get("", response_model=DocumentListResponse)
 def list_documents() -> DocumentListResponse:
     connection = connect()
@@ -69,277 +112,60 @@ def list_documents() -> DocumentListResponse:
         rows = connection.execute(
             "SELECT * FROM documents ORDER BY created_at DESC"
         ).fetchall()
-        return DocumentListResponse(documents=[document_from_row(row) for row in rows])
+        tags = _tags_by_document(connection)
+        return DocumentListResponse(
+            documents=[document_from_row(row, tags.get(row["id"], [])) for row in rows]
+        )
     finally:
         connection.close()
+
+
+@router.get("/options", response_model=DocumentOptionsResponse)
+def list_document_options() -> DocumentOptionsResponse:
+    """Known types, custom types already used in the vault, groups, and tags in use."""
+    connection = connect()
+    try:
+        # With MAX(created_at), SQLite takes the other columns from the newest row,
+        # so each type shows the label and group it was given most recently.
+        custom = connection.execute(
+            """
+            SELECT document_type, document_label AS label, document_group AS grp,
+                   MAX(created_at)
+            FROM documents
+            WHERE document_type IS NOT NULL AND document_label IS NOT NULL
+            GROUP BY document_type
+            ORDER BY label COLLATE NOCASE
+            """
+        ).fetchall()
+        tags = connection.execute(
+            "SELECT DISTINCT tag FROM document_tags ORDER BY tag COLLATE NOCASE"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    types = [
+        DocumentTypeOption(value=key, label=label, group=group)
+        for key, (label, group) in KNOWN_TYPES.items()
+    ]
+    types.extend(
+        DocumentTypeOption(value=row["document_type"], label=row["label"], group=row["grp"] or "other")
+        for row in custom
+        if row["document_type"] not in KNOWN_TYPES
+    )
+    return DocumentOptionsResponse(
+        types=types,
+        groups=[DocumentGroupOption(value=key, label=label) for key, label in DOCUMENT_GROUPS.items()],
+        tags=[row["tag"] for row in tags],
+    )
 
 
 @router.get("/{document_id}", response_model=DocumentRecord)
 def get_document(document_id: str) -> DocumentRecord:
     connection = connect()
     try:
-        return document_from_row(fetch_document(connection, document_id))
+        return load_record(connection, document_id)
     finally:
         connection.close()
-
-
-def process_pdf_document(document_id: str) -> None:
-    """Extract selectable PDF text, then OCR the file when that text is sparse."""
-    stored_path = _mark_processing(document_id, "application/pdf")
-    if stored_path is None:
-        return
-
-    try:
-        file_path = str(resolve_stored_path(stored_path))
-        result = extract_pdf_text(file_path)
-        if _text_is_sparse(str(result["text"]), int(result["page_count"])):
-            result = ocr_pdf(file_path)
-    except Exception as error:
-        _mark_failed(document_id, error, "Could not extract text from this PDF.")
-        return
-
-    _finish_document(document_id, str(result["text"]), int(result["page_count"]))
-
-
-def process_image_document(document_id: str) -> None:
-    """OCR an uploaded image. Images are single pages and have no PDF page markers."""
-    stored_path = _mark_processing(document_id, None)
-    if stored_path is None:
-        return
-
-    try:
-        text = ocr_image(str(resolve_stored_path(stored_path)))
-    except Exception as error:
-        _mark_failed(document_id, error, "Could not read text from this image.")
-        return
-
-    _finish_document(document_id, text, 1)
-
-
-def _mark_processing(document_id: str, media_type):
-    connection = connect()
-    try:
-        row = connection.execute(
-            "SELECT media_type, stored_path FROM documents WHERE id = ?",
-            (document_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        if media_type is not None and row["media_type"] != media_type:
-            return None
-        if media_type is None and not str(row["media_type"]).startswith("image/"):
-            return None
-        with connection:
-            connection.execute(
-                """
-                UPDATE documents
-                SET status = 'processing', error_message = NULL
-                WHERE id = ?
-                """,
-                (document_id,),
-            )
-        return row["stored_path"]
-    finally:
-        connection.close()
-
-
-def _finish_document(document_id: str, text: str, page_count: int) -> None:
-    try:
-        classification = classify_document(text)
-    except Exception as error:
-        message = " ".join(str(error).split()) or "Could not classify this document."
-        if "/" in message or "\\" in message:
-            message = "Could not classify this document."
-        classification_type = None
-        confidence = None
-        classification_status = "failed"
-        reasoning = message[:500]
-    else:
-        classification_type = classification.document_type
-        confidence = classification.confidence
-        classification_status = classification.status
-        reasoning = classification.reasoning
-
-    connection = connect()
-    try:
-        with connection:
-            connection.execute(
-                """
-                UPDATE documents
-                SET full_text = ?, page_count = ?, status = 'ready', error_message = NULL,
-                    document_type = ?, classification_confidence = ?,
-                    classification_status = ?, classification_reasoning = ?,
-                    field_extraction_status = ?, field_extraction_error = NULL
-                WHERE id = ?
-                """,
-                (
-                    text,
-                    page_count,
-                    classification_type,
-                    confidence,
-                    classification_status,
-                    reasoning,
-                    "processing" if _can_extract(classification_type, text) else "needs_review",
-                    document_id,
-                ),
-            )
-    finally:
-        connection.close()
-
-    if _can_extract(classification_type, text):
-        run_field_extraction(document_id)
-    try:
-        from services.index import _mark_index_failed, index_document
-
-        index_document(document_id)
-    except Exception:
-        _mark_index_failed(document_id, "Could not index this document.")
-
-
-def _can_extract(document_type, text: str) -> bool:
-    if document_type not in FIELD_SCHEMAS:
-        return False
-    body = re.sub(r"\[Page \d+\]", "", text or "")
-    return len("".join(body.split())) >= 40
-
-
-def run_field_extraction(document_id: str) -> None:
-    connection = connect()
-    try:
-        row = connection.execute(
-            "SELECT status, document_type, full_text FROM documents WHERE id = ?",
-            (document_id,),
-        ).fetchone()
-        if row is None or row["status"] != "ready":
-            return
-        document_type = row["document_type"]
-        text = row["full_text"] or ""
-        if not _can_extract(document_type, text):
-            with connection:
-                connection.execute(
-                    """
-                    UPDATE documents
-                    SET field_extraction_status = 'needs_review',
-                        field_extraction_error = NULL
-                    WHERE id = ?
-                    """,
-                    (document_id,),
-                )
-            return
-        with connection:
-            connection.execute(
-                """
-                UPDATE documents
-                SET field_extraction_status = 'processing', field_extraction_error = NULL
-                WHERE id = ?
-                """,
-                (document_id,),
-            )
-    finally:
-        connection.close()
-
-    try:
-        outcome = extract_fields(document_type, text)
-    except Exception as error:
-        message = " ".join(str(error).split()) or "Could not extract fields."
-        if "/" in message or "\\" in message:
-            message = "Could not extract fields."
-        _set_field_status(document_id, "failed", message[:500])
-        return
-
-    if outcome.status != "completed":
-        _set_field_status(document_id, outcome.status, outcome.error)
-        return
-
-    connection = connect()
-    try:
-        with connection:
-            verified = {
-                row["name"]
-                for row in connection.execute(
-                    """
-                    SELECT name FROM document_fields
-                    WHERE document_id = ? AND verification_status = 'verified'
-                    """,
-                    (document_id,),
-                ).fetchall()
-            }
-            connection.execute(
-                """
-                DELETE FROM document_fields
-                WHERE document_id = ? AND verification_status != 'verified'
-                """,
-                (document_id,),
-            )
-            for field in outcome.fields:
-                if field.field_name in verified:
-                    continue
-                connection.execute(
-                    """
-                    INSERT INTO document_fields (
-                        document_id, name, value, verification_status, source_text
-                    ) VALUES (?, ?, ?, 'extracted', ?)
-                    """,
-                    (
-                        document_id,
-                        field.field_name,
-                        field.extracted_value,
-                        field.source_text,
-                    ),
-                )
-            connection.execute(
-                """
-                UPDATE documents
-                SET field_extraction_status = 'completed', field_extraction_error = NULL
-                WHERE id = ?
-                """,
-                (document_id,),
-            )
-    finally:
-        connection.close()
-
-
-def _set_field_status(document_id: str, status: str, error) -> None:
-    connection = connect()
-    try:
-        with connection:
-            connection.execute(
-                """
-                UPDATE documents
-                SET field_extraction_status = ?, field_extraction_error = ?
-                WHERE id = ?
-                """,
-                (status, error, document_id),
-            )
-    finally:
-        connection.close()
-
-
-def _mark_failed(document_id: str, error: Exception, fallback: str) -> None:
-    message = " ".join(str(error).split()) or fallback
-    if "/" in message or "\\" in message:
-        message = fallback
-    connection = connect()
-    try:
-        with connection:
-            connection.execute(
-                """
-                UPDATE documents
-                SET status = 'failed', error_message = ?
-                WHERE id = ?
-                """,
-                (message[:500], document_id),
-            )
-    finally:
-        connection.close()
-
-
-def _text_is_sparse(text: str, page_count: int) -> bool:
-    """True when selectable text is too short to skip OCR."""
-    body = re.sub(r"\[Page \d+\]", "", text or "")
-    characters = len("".join(body.split()))
-    pages = page_count if page_count > 0 else 1
-    return characters < 20 * pages
 
 
 @router.post("", response_model=DocumentRecord, status_code=201)
@@ -347,18 +173,18 @@ async def create_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
 ) -> DocumentRecord:
+    """Store any file. Readable formats are processed; other files are kept as they are."""
     try:
         try:
             filename = safe_original_name(file.filename or "")
-            suffix = extension_for(filename)
-            media_type = media_type_for(suffix, file.content_type or "")
             document_id = str(uuid.uuid4())
-            stored_path = save_upload(document_id, suffix, file.file)
+            upload = save_upload(document_id, filename, file.file)
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
     finally:
         await file.close()
 
+    readable = is_readable(upload.media_type)
     connection = connect()
     try:
         try:
@@ -366,65 +192,103 @@ async def create_document(
                 connection.execute(
                     """
                     INSERT INTO documents (
-                        id, filename, media_type, stored_path, page_count,
-                        document_type, status, error_message, full_text,
-                        field_extraction_status
-                    ) VALUES (?, ?, ?, ?, NULL, NULL, 'uploaded', NULL, NULL, 'pending')
+                        id, filename, media_type, stored_path, status, error_message,
+                        field_extraction_status, index_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (document_id, filename, media_type, stored_path),
+                    (
+                        document_id,
+                        filename,
+                        upload.media_type,
+                        upload.stored_path,
+                        "uploaded" if readable else "stored",
+                        upload.note,
+                        "pending" if readable else "skipped",
+                        None if readable else "skipped",
+                    ),
                 )
-                row = fetch_document(connection, document_id)
-                record = document_from_row(row)
+                record = load_record(connection, document_id)
         except Exception:
-            delete_stored_file(stored_path)
+            delete_stored_file(upload.stored_path)
             raise
     finally:
         connection.close()
 
-    if media_type == "application/pdf":
-        background_tasks.add_task(process_pdf_document, document_id)
-    elif media_type.startswith("image/"):
-        background_tasks.add_task(process_image_document, document_id)
-
+    if readable:
+        background_tasks.add_task(process_document, document_id)
     return record
 
 
 @router.patch("/{document_id}", response_model=DocumentRecord)
-def update_document_type(
+def update_document(
     document_id: str,
-    body: DocumentTypeUpdate,
+    body: DocumentUpdate,
     background_tasks: BackgroundTasks,
 ) -> DocumentRecord:
-    document_type = body.document_type.strip().lower()
-    if document_type not in DOCUMENT_TYPES:
-        raise HTTPException(status_code=400, detail="Unsupported document type.")
+    """Change the type, group, tags, or notes. A new type re-runs field extraction."""
+    group = None
+    if body.document_group is not None:
+        group = normalize_group(body.document_group)
+        if group is None:
+            raise HTTPException(status_code=400, detail="Unknown document group.")
 
     connection = connect()
     try:
         row = fetch_document(connection, document_id)
-        text = row["full_text"] or ""
-        extractable = row["status"] == "ready" and _can_extract(document_type, text)
+        extract = False
         with connection:
-            connection.execute(
-                """
-                UPDATE documents
-                SET document_type = ?, classification_confidence = NULL,
-                    classification_status = 'verified',
-                    classification_reasoning = 'Corrected manually.',
-                    field_extraction_status = ?, field_extraction_error = NULL
-                WHERE id = ?
-                """,
-                (
-                    document_type,
-                    "processing" if extractable else "needs_review",
-                    document_id,
-                ),
-            )
-            updated = document_from_row(fetch_document(connection, document_id))
+            if body.document_type is not None:
+                try:
+                    document_type, label, resolved_group = resolve_type(body.document_type, group)
+                except ValueError as error:
+                    raise HTTPException(status_code=400, detail=str(error)) from error
+                changed = document_type != row["document_type"]
+                extract = (
+                    row["status"] == "ready"
+                    and can_extract(document_type, row["full_text"] or "")
+                    and (changed or row["field_extraction_status"] != "completed")
+                )
+                field_status = row["field_extraction_status"]
+                if extract:
+                    field_status = "processing"
+                elif row["status"] == "ready" and changed:
+                    field_status = "needs_review"
+                connection.execute(
+                    """
+                    UPDATE documents
+                    SET document_type = ?, document_label = ?, document_group = ?,
+                        classification_confidence = NULL,
+                        classification_status = 'verified',
+                        classification_method = 'manual',
+                        classification_reasoning = 'Set manually.',
+                        field_extraction_status = ?, field_extraction_error = NULL
+                    WHERE id = ?
+                    """,
+                    (document_type, label, resolved_group, field_status, document_id),
+                )
+            elif group is not None:
+                connection.execute(
+                    "UPDATE documents SET document_group = ? WHERE id = ?",
+                    (group, document_id),
+                )
+            if body.notes is not None:
+                connection.execute(
+                    "UPDATE documents SET notes = ? WHERE id = ?",
+                    (body.notes.strip() or None, document_id),
+                )
+            if body.tags is not None:
+                connection.execute(
+                    "DELETE FROM document_tags WHERE document_id = ?", (document_id,)
+                )
+                connection.executemany(
+                    "INSERT INTO document_tags (document_id, tag) VALUES (?, ?)",
+                    [(document_id, tag) for tag in body.tags],
+                )
+        updated = load_record(connection, document_id)
     finally:
         connection.close()
 
-    if extractable:
+    if extract:
         background_tasks.add_task(run_field_extraction, document_id)
     return updated
 
@@ -435,12 +299,7 @@ def list_document_fields(document_id: str) -> DocumentFieldsResponse:
     try:
         document = fetch_document(connection, document_id)
         rows = connection.execute(
-            """
-            SELECT id, document_id, name, value, verification_status, source_text
-            FROM document_fields
-            WHERE document_id = ?
-            ORDER BY id
-            """,
+            "SELECT * FROM document_fields WHERE document_id = ? ORDER BY id",
             (document_id,),
         ).fetchall()
         document_type = document["document_type"]
@@ -450,17 +309,7 @@ def list_document_fields(document_id: str) -> DocumentFieldsResponse:
             field_extraction_error=document["field_extraction_error"],
             document_type=document_type,
             expected_fields=expected,
-            fields=[
-                DocumentField(
-                    id=row["id"],
-                    document_id=row["document_id"],
-                    field_name=row["name"],
-                    extracted_value=row["value"],
-                    verification_status=row["verification_status"] or "extracted",
-                    source_text=row["source_text"],
-                )
-                for row in rows
-            ],
+            fields=[field_from_row(row) for row in rows],
         )
     finally:
         connection.close()
@@ -478,40 +327,27 @@ def update_document_field(
     try:
         fetch_document(connection, document_id)
         row = connection.execute(
-            """
-            SELECT id, document_id, name, value, verification_status, source_text
-            FROM document_fields
-            WHERE id = ? AND document_id = ?
-            """,
+            "SELECT * FROM document_fields WHERE id = ? AND document_id = ?",
             (field_id, document_id),
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Field not found.")
+        value = value[:2000]
+        normalized = unambiguous_iso_date(value, day_first=True) if row["kind"] == "date" else None
         with connection:
             connection.execute(
                 """
                 UPDATE document_fields
-                SET value = ?, verification_status = 'verified'
+                SET value = ?, normalized_value = ?, verification_status = 'verified'
                 WHERE id = ? AND document_id = ?
                 """,
-                (value[:2000], field_id, document_id),
+                (value, normalized, field_id, document_id),
             )
         updated = connection.execute(
-            """
-            SELECT id, document_id, name, value, verification_status, source_text
-            FROM document_fields
-            WHERE id = ?
-            """,
+            "SELECT * FROM document_fields WHERE id = ?",
             (field_id,),
         ).fetchone()
-        return DocumentField(
-            id=updated["id"],
-            document_id=updated["document_id"],
-            field_name=updated["name"],
-            extracted_value=updated["value"],
-            verification_status=updated["verification_status"],
-            source_text=updated["source_text"],
-        )
+        return field_from_row(updated)
     finally:
         connection.close()
 
@@ -532,7 +368,7 @@ def retry_field_extraction(
                 status_code=400,
                 detail="Confirm a document type before extracting fields.",
             )
-        if not _can_extract(row["document_type"], row["full_text"] or ""):
+        if not can_extract(row["document_type"], row["full_text"] or ""):
             raise HTTPException(
                 status_code=400,
                 detail="Not enough extracted text to find fields.",
@@ -546,7 +382,7 @@ def retry_field_extraction(
                 """,
                 (document_id,),
             )
-            record = document_from_row(fetch_document(connection, document_id))
+            record = load_record(connection, document_id)
     finally:
         connection.close()
 
@@ -570,7 +406,7 @@ def reindex_document(document_id: str, background_tasks: BackgroundTasks) -> Doc
                 """,
                 (document_id,),
             )
-            record = document_from_row(fetch_document(connection, document_id))
+            record = load_record(connection, document_id)
     finally:
         connection.close()
     from services.index import index_document

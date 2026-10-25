@@ -5,7 +5,9 @@ import type {
   DocumentField,
   DocumentFieldsResponse,
   DocumentListResponse,
+  DocumentOptions,
   DocumentRecord,
+  DocumentUpdate,
   HealthResponse,
   ImportableField,
   ProfileConflict,
@@ -72,10 +74,14 @@ export function uploadDocument(file: File) {
   return request<DocumentRecord>("/documents", { method: "POST", body });
 }
 
-export function updateDocumentType(id: string, documentType: string) {
+export function getDocumentOptions() {
+  return request<DocumentOptions>("/documents/options");
+}
+
+export function updateDocument(id: string, update: DocumentUpdate) {
   return request<DocumentRecord>(`/documents/${id}`, {
     method: "PATCH",
-    body: JSON.stringify({ document_type: documentType }),
+    body: JSON.stringify(update),
   });
 }
 

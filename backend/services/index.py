@@ -99,7 +99,8 @@ def retrieve_passages(query: str, limit: int = 8) -> list:
             row = connection.execute(
                 """
                 SELECT chunks.id, chunks.chunk_index, chunks.page_number, chunks.text,
-                       documents.id AS document_id, documents.filename, documents.document_type
+                       documents.id AS document_id, documents.filename, documents.document_type,
+                       documents.document_label
                 FROM chunks
                 JOIN documents ON documents.id = chunks.document_id
                 WHERE chunks.id = ?
@@ -117,6 +118,7 @@ def retrieve_passages(query: str, limit: int = 8) -> list:
                     "document_id": row["document_id"],
                     "filename": row["filename"],
                     "document_type": row["document_type"],
+                    "document_label": row["document_label"],
                     "score": round(float(hit["score"]), 4),
                 }
             )
