@@ -1,18 +1,36 @@
-from fastapi import APIRouter, HTTPException
+import json
+from itertools import chain
 
-from models import ChatRequest, ChatResponse
-from services.rag import answer_question
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+
+from models import ChatRequest
+from services.rag import stream_answer
 
 router = APIRouter(tags=["chat"])
 
 
-@router.post("/chat", response_model=ChatResponse)
-def chat(body: ChatRequest) -> ChatResponse:
+@router.post("/chat")
+def chat(body: ChatRequest) -> StreamingResponse:
+    """Stream the answer as newline-delimited JSON: sources, tokens, then done."""
+    events = stream_answer(
+        body.message,
+        [item.model_dump() for item in body.history],
+        body.document_id,
+    )
     try:
-        result = answer_question(
-            body.message,
-            [item.model_dump() for item in body.history],
-        )
+        # Retrieval runs here, so its failures become a normal HTTP error.
+        first = next(events)
     except ValueError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
-    return ChatResponse(**result)
+    return StreamingResponse(
+        (json.dumps(event) + "\n" for event in _guarded(chain([first], events))),
+        media_type="application/x-ndjson",
+    )
+
+
+def _guarded(events):
+    try:
+        yield from events
+    except ValueError as error:
+        yield {"type": "error", "message": str(error)}

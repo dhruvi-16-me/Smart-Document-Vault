@@ -1,6 +1,7 @@
 import type {
   ChatMessage,
-  ChatResponse,
+  DashboardResponse,
+  ChatSource,
   DocumentDeleteResponse,
   DocumentField,
   DocumentFieldsResponse,
@@ -56,6 +57,10 @@ async function readError(response: Response): Promise<ApiError> {
   }
 }
 
+export function getDashboard() {
+  return request<DashboardResponse>("/dashboard");
+}
+
 export function getHealth() {
   return request<HealthResponse>("/health");
 }
@@ -94,6 +99,11 @@ export function updateDocumentField(id: string, fieldId: number, extractedValue:
     method: "PATCH",
     body: JSON.stringify({ extracted_value: extractedValue }),
   });
+}
+
+/** Run again whichever of identification, field reading, and indexing did not finish. */
+export function retryDocument(id: string) {
+  return request<DocumentRecord>(`/documents/${id}/retry`, { method: "POST" });
 }
 
 export function retryFieldExtraction(id: string) {
@@ -171,12 +181,67 @@ export function searchDocuments(query: string) {
   return request<SearchResponse>(`/search?${params.toString()}`);
 }
 
-export function sendChat(message: string, history: ChatMessage[]) {
-  return request<ChatResponse>("/chat", {
+export function previewUrl(id: string, page = 1) {
+  return `${API_BASE}/documents/${id}/preview?page=${page}`;
+}
+
+export function thumbnailUrl(id: string) {
+  return `${API_BASE}/documents/${id}/thumbnail`;
+}
+
+// The API accepts at most this many earlier messages.
+const CHAT_HISTORY_LIMIT = 8;
+
+export type ChatStreamHandlers = {
+  onSources: (sources: ChatSource[]) => void;
+  onToken: (text: string) => void;
+  onDone: (answer: string, status: string) => void;
+};
+
+/** Send a question and read the newline-delimited JSON answer as it is written. */
+export async function streamChat(
+  message: string,
+  history: ChatMessage[],
+  documentId: string | null,
+  handlers: ChatStreamHandlers,
+  signal: AbortSignal,
+) {
+  const response = await fetch(`${API_BASE}/chat`, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       message,
-      history: history.map((item) => ({ role: item.role, content: item.content })),
+      document_id: documentId,
+      history: history
+        .slice(-CHAT_HISTORY_LIMIT)
+        .map((item) => ({ role: item.role, content: item.content })),
     }),
+    signal,
   });
+  if (!response.ok || !response.body) {
+    throw await readError(response);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines.filter(Boolean)) {
+      const event = JSON.parse(line) as
+        | { type: "sources"; sources: ChatSource[] }
+        | { type: "token"; text: string }
+        | { type: "done"; answer: string; status: string }
+        | { type: "error"; message: string };
+      if (event.type === "sources") handlers.onSources(event.sources);
+      else if (event.type === "token") handlers.onToken(event.text);
+      else if (event.type === "done") handlers.onDone(event.answer, event.status);
+      else throw new Error(event.message);
+    }
+    if (done) {
+      return;
+    }
+  }
 }

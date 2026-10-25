@@ -3,7 +3,8 @@ import sqlite3
 import uuid
 from typing import Dict, List
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, Response
 
 from database import connect
 from models import (
@@ -20,14 +21,30 @@ from models import (
 )
 from services.document_types import DOCUMENT_GROUPS, KNOWN_TYPES, normalize_group, resolve_type
 from services.fields import FIELD_SCHEMAS
-from services.pipeline import can_extract, process_document, run_field_extraction
+from services.pipeline import (
+    can_extract,
+    process_document,
+    retry_failed_steps,
+    run_field_extraction,
+)
+from services.preview import (
+    BROWSER_NATIVE,
+    PREVIEW_EDGE,
+    THUMBNAIL_EDGE,
+    can_preview,
+    page_jpeg,
+)
 from services.profile import unambiguous_iso_date
 from services.storage import (
     delete_stored_file,
     is_readable,
+    resolve_stored_path,
     safe_original_name,
     save_upload,
 )
+
+# Previews are personal documents: the browser may keep them briefly, never share them.
+PREVIEW_CACHE = "private, max-age=300"
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -113,8 +130,10 @@ def list_documents() -> DocumentListResponse:
             "SELECT * FROM documents ORDER BY created_at DESC"
         ).fetchall()
         tags = _tags_by_document(connection)
+        documents = [document_from_row(row, tags.get(row["id"], [])) for row in rows]
+        # The list never shows text; GET /documents/{id} returns it for one document.
         return DocumentListResponse(
-            documents=[document_from_row(row, tags.get(row["id"], [])) for row in rows]
+            documents=[document.model_copy(update={"full_text": None}) for document in documents]
         )
     finally:
         connection.close()
@@ -390,6 +409,39 @@ def retry_field_extraction(
     return record
 
 
+@router.post("/{document_id}/retry", response_model=DocumentRecord)
+def retry_document(document_id: str, background_tasks: BackgroundTasks) -> DocumentRecord:
+    """Run again whichever of identification, field reading, and indexing did not finish."""
+    connection = connect()
+    try:
+        row = fetch_document(connection, document_id)
+        if row["status"] != "ready":
+            raise HTTPException(status_code=400, detail="Document text is not ready.")
+        classify = row["classification_status"] == "failed"
+        extract = classify or row["field_extraction_status"] in {"failed", "needs_review"}
+        index = row["index_status"] != "indexed"
+        if not (classify or extract or index):
+            raise HTTPException(status_code=400, detail="Every step has already finished.")
+        with connection:
+            connection.execute(
+                """
+                UPDATE documents
+                SET classification_status = CASE WHEN ? THEN 'processing' ELSE classification_status END,
+                    field_extraction_status = CASE WHEN ? THEN 'processing' ELSE field_extraction_status END,
+                    field_extraction_error = CASE WHEN ? THEN NULL ELSE field_extraction_error END,
+                    index_status = CASE WHEN ? THEN 'processing' ELSE index_status END,
+                    index_error = CASE WHEN ? THEN NULL ELSE index_error END
+                WHERE id = ?
+                """,
+                (classify, extract, extract, index, index, document_id),
+            )
+        record = load_record(connection, document_id)
+    finally:
+        connection.close()
+    background_tasks.add_task(retry_failed_steps, document_id, classify, extract, index)
+    return record
+
+
 @router.post("/{document_id}/index", response_model=DocumentRecord)
 def reindex_document(document_id: str, background_tasks: BackgroundTasks) -> DocumentRecord:
     connection = connect()
@@ -413,6 +465,48 @@ def reindex_document(document_id: str, background_tasks: BackgroundTasks) -> Doc
 
     background_tasks.add_task(index_document, document_id)
     return record
+
+
+@router.get("/{document_id}/preview")
+def preview_document(document_id: str, page: int = Query(1, ge=1)):
+    """The original file when the browser can show it, otherwise one page as JPEG."""
+    connection = connect()
+    try:
+        row = fetch_document(connection, document_id)
+    finally:
+        connection.close()
+    media_type = row["media_type"]
+    if not can_preview(media_type):
+        raise HTTPException(status_code=404, detail="This file type has no preview.")
+    path = resolve_stored_path(row["stored_path"])
+    if media_type in BROWSER_NATIVE:
+        return FileResponse(
+            path,
+            media_type=media_type,
+            content_disposition_type="inline",
+            filename=row["filename"],
+            headers={"Cache-Control": PREVIEW_CACHE},
+        )
+    return _jpeg_response(page_jpeg(str(path), media_type, page, PREVIEW_EDGE))
+
+
+@router.get("/{document_id}/thumbnail")
+def document_thumbnail(document_id: str):
+    connection = connect()
+    try:
+        row = fetch_document(connection, document_id)
+    finally:
+        connection.close()
+    if not can_preview(row["media_type"]):
+        raise HTTPException(status_code=404, detail="This file type has no preview.")
+    path = resolve_stored_path(row["stored_path"])
+    return _jpeg_response(page_jpeg(str(path), row["media_type"], 1, THUMBNAIL_EDGE))
+
+
+def _jpeg_response(image) -> Response:
+    if image is None:
+        raise HTTPException(status_code=404, detail="This page could not be shown.")
+    return Response(image, media_type="image/jpeg", headers={"Cache-Control": PREVIEW_CACHE})
 
 
 @router.delete("/{document_id}", response_model=DocumentDeleteResponse)

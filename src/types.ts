@@ -23,13 +23,66 @@ export function fileTypeLabel(document: Pick<DocumentRecord, "media_type" | "fil
   return extension || "File";
 }
 
-export const DOCUMENT_STATUS_LABELS: Record<string, string> = {
-  uploaded: "Uploaded",
-  processing: "Processing",
-  ready: "Ready",
-  failed: "Could not read",
-  stored: "Stored only",
+/** The one status worth showing on a document, or null when it is ready and fine. */
+export function statusBadge(
+  document: DocumentRecord,
+): { label: string; tone: "blue" | "red" | "stone" | "amber" } | null {
+  if (document.status === "uploaded" || document.status === "processing") {
+    return { label: "Reading…", tone: "blue" };
+  }
+  if (document.status === "failed") {
+    return { label: "Could not read", tone: "red" };
+  }
+  if (document.status === "stored") {
+    return { label: "Stored only", tone: "stone" };
+  }
+  if (document.classification_status === "failed" || document.index_status === "failed") {
+    return { label: "Not finished", tone: "amber" };
+  }
+  if (document.low_confidence_pages.length > 0) {
+    return { label: "Check scan", tone: "amber" };
+  }
+  if (
+    document.field_extraction_status === "needs_review" ||
+    document.field_extraction_status === "failed"
+  ) {
+    return { label: "Needs review", tone: "amber" };
+  }
+  return null;
+}
+
+/** Steps that failed after the text was read, usually because Ollama was not running. */
+export function unfinishedSteps(document: DocumentRecord) {
+  if (document.status !== "ready") {
+    return [];
+  }
+  return [
+    document.classification_status === "failed" ? "identify its type" : null,
+    document.field_extraction_status === "failed" ? "read its fields" : null,
+    document.index_status === "failed" ? "make it searchable" : null,
+  ].filter((step): step is string => step !== null);
+}
+
+/**
+ * One colour per category, from a categorical palette validated for colour-blind
+ * separation. The mapping is fixed so a category never changes colour; "other" is grey.
+ * These colours mark identity only (dots, strips); text beside them stays in ink colours.
+ */
+export const GROUP_COLORS: Record<string, string> = {
+  identity: "#2a78d6",
+  education: "#eb6834",
+  financial: "#1baf7a",
+  property: "#eda100",
+  medical: "#e87ba4",
+  employment: "#008300",
+  legal: "#4a3aa7",
+  vehicle: "#e34948",
+  other: "#a8a29e",
 };
+
+export function groupColor(group: string | null) {
+  return GROUP_COLORS[group ?? "other"] ?? GROUP_COLORS.other;
+}
 
 export function groupLabel(group: string | null) {
   return group ? group.charAt(0).toUpperCase() + group.slice(1) : null;
@@ -148,11 +201,29 @@ export type ProfileConflict = {
   proposed_document_field_id: number | null;
 };
 
+export type UpcomingDate = {
+  document_id: string;
+  filename: string;
+  document_label: string | null;
+  document_group: string | null;
+  field_label: string;
+  date_role: string;
+  date: string;
+  days_left: number;
+  page_number: number | null;
+  verified: boolean;
+};
+
+export type DashboardResponse = {
+  upcoming: UpcomingDate[];
+};
+
 export type SearchHit = {
   document_id: string;
   filename: string;
   document_type: string | null;
   document_label: string | null;
+  document_group: string | null;
   chunk_index: number;
   page_number: number | null;
   text: string;
@@ -168,6 +239,8 @@ export type ChatMessage = {
   content: string;
   sources?: ChatSource[];
   status?: string;
+  streaming?: boolean;
+  scopeLabel?: string; // the document a question was limited to
 };
 
 export type ChatSource = {
@@ -178,12 +251,6 @@ export type ChatSource = {
   chunk_id: number;
   snippet: string;
   score: number;
-};
-
-export type ChatResponse = {
-  answer: string;
-  sources: ChatSource[];
-  status: string;
 };
 
 export type HealthResponse = {

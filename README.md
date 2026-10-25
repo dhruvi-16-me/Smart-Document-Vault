@@ -121,4 +121,4 @@ Open the Vite URL, usually `http://127.0.0.1:5173`. The header shows `API ok` wh
 { "status": "ok" }
 ```
 
-`POST /documents` stores any file and adds it to the vault. `PATCH /documents/{id}` changes its type, group, tags, or notes. `GET /documents/options` lists known types, custom types already in use, groups, and tags.
+`POST /documents` stores any file and adds it to the vault. `PATCH /documents/{id}` changes its type, group, tags, or notes. `GET /documents/options` lists known types, custom types already in use, groups, and tags. `GET /documents/{id}/preview` and `/thumbnail` show the original file to the local UI; HEIC and TIFF pages are converted to JPEG in memory. `POST /chat` streams the answer as newline-delimited JSON (sources, then text, then a final answer); pass `document_id` to search only that document.

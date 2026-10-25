@@ -10,6 +10,8 @@ import {
   resolveProfileConflict,
   updateProfileField,
 } from "../api.ts";
+import { Button } from "../components/ui.tsx";
+import { useToast } from "../toast.ts";
 import type { ImportableField, ProfileConflict, ProfileField } from "../types.ts";
 
 const SECTIONS = [
@@ -61,6 +63,7 @@ export function ProfilePage({ onOpenDocument }: { onOpenDocument: (id: string) =
   const [addName, setAddName] = useState("full_name");
   const [addValue, setAddValue] = useState("");
   const [adding, setAdding] = useState(false);
+  const toast = useToast();
 
   useEffect(() => {
     let active = true;
@@ -94,6 +97,7 @@ export function ProfilePage({ onOpenDocument }: { onOpenDocument: (id: string) =
     try {
       replaceField(await createProfileField(addName, addValue));
       setAddValue("");
+      toast("Added to your profile");
       setConflict(null);
     } catch (failure) {
       if (isProfileConflict(failure)) {
@@ -121,6 +125,7 @@ export function ProfilePage({ onOpenDocument }: { onOpenDocument: (id: string) =
     try {
       replaceField(await importProfileField(item.document_id, item.document_field_id));
       setConflict(null);
+      toast("Imported to your profile");
     } catch (failure) {
       if (isProfileConflict(failure)) {
         setConflict(failure.detail);
@@ -166,8 +171,8 @@ export function ProfilePage({ onOpenDocument }: { onOpenDocument: (id: string) =
     <section className="space-y-6">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h2 className="text-2xl font-semibold text-stone-900">Profile</h2>
-          <p className="mt-1 text-sm text-stone-600">
+          <h1 className="text-2xl font-semibold tracking-tight text-stone-900">Profile</h1>
+          <p className="mt-1 text-stone-600">
             Only values you verify are saved here.
           </p>
         </div>
@@ -176,14 +181,14 @@ export function ProfilePage({ onOpenDocument }: { onOpenDocument: (id: string) =
           onClick={() => {
             void loadImportable();
           }}
-          className="rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm"
+          className="rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50"
         >
           Import from documents
         </button>
       </div>
       {error ? <p className="text-sm text-red-700">{error}</p> : null}
       {fields === null && !error ? (
-        <p className="text-sm text-stone-500">Loading profile…</p>
+        <p className="text-sm text-stone-600">Loading profile…</p>
       ) : null}
       {fields?.length === 0 ? (
         <p className="text-sm text-stone-600">No profile fields yet.</p>
@@ -202,8 +207,8 @@ export function ProfilePage({ onOpenDocument }: { onOpenDocument: (id: string) =
         />
       ) : null}
       {importable ? (
-        <section className="rounded-xl border border-stone-200 bg-white p-4">
-          <h3 className="text-sm font-medium text-stone-900">Verified document fields</h3>
+        <section className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
+          <h3 className="font-semibold text-stone-900">Verified document fields</h3>
           {importError ? <p className="mt-2 text-sm text-red-700">{importError}</p> : null}
           {importable.length === 0 ? (
             <p className="mt-3 text-sm text-stone-600">
@@ -220,14 +225,14 @@ export function ProfilePage({ onOpenDocument }: { onOpenDocument: (id: string) =
                     <p className="font-medium text-stone-900">
                       {fieldLabel(item.field_name)}: {item.proposed_value}
                     </p>
-                    <p className="text-stone-500">{item.document_filename}</p>
+                    <p className="text-stone-600">{item.document_filename}</p>
                   </div>
                   <button
                     type="button"
                     onClick={() => {
                       void importField(item);
                     }}
-                    className="rounded-lg bg-stone-900 px-3 py-1.5 text-white"
+                    className="rounded-lg bg-brand-600 px-3 py-1.5 font-medium text-white hover:bg-brand-700"
                   >
                     Import
                   </button>
@@ -239,10 +244,10 @@ export function ProfilePage({ onOpenDocument }: { onOpenDocument: (id: string) =
       ) : null}
       {fields
         ? SECTIONS.map((section) => (
-            <section key={section.title} className="rounded-xl border border-stone-200 bg-white p-4">
-              <h3 className="text-sm font-medium text-stone-900">{section.title}</h3>
+            <section key={section.title} className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
+              <h3 className="font-semibold text-stone-900">{section.title}</h3>
               {section.fields.every((name) => !stored.has(name)) ? (
-                <p className="mt-3 text-sm text-stone-500">Nothing saved in this section.</p>
+                <p className="mt-3 text-sm text-stone-600">Nothing saved in this section.</p>
               ) : (
                 <div className="mt-3 divide-y divide-stone-100">
                   {section.fields.map((name) => {
@@ -267,19 +272,19 @@ export function ProfilePage({ onOpenDocument }: { onOpenDocument: (id: string) =
         : null}
       {fields && missing.length > 0 ? (
         <form
-          className="grid max-w-xl gap-3 rounded-xl border border-stone-200 bg-white p-4"
+          className="grid max-w-xl gap-3 rounded-2xl border border-stone-200 bg-white p-5 shadow-sm"
           onSubmit={(event) => {
             event.preventDefault();
             void addField();
           }}
         >
-          <h3 className="text-sm font-medium text-stone-900">Add a field</h3>
+          <h3 className="font-semibold text-stone-900">Add a field</h3>
           <label className="grid gap-1 text-sm">
             <span className="text-stone-600">Field</span>
             <select
               value={missing.includes(addName as (typeof ALL_FIELDS)[number]) ? addName : missing[0]}
               onChange={(event) => setAddName(event.target.value)}
-              className="rounded-lg border border-stone-300 px-3 py-2"
+              className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 shadow-sm placeholder:text-stone-500 focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 focus:outline-none"
             >
               {missing.map((name) => (
                 <option key={name} value={name}>
@@ -293,13 +298,13 @@ export function ProfilePage({ onOpenDocument }: { onOpenDocument: (id: string) =
             <input
               value={addValue}
               onChange={(event) => setAddValue(event.target.value)}
-              className="rounded-lg border border-stone-300 px-3 py-2"
+              className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 shadow-sm placeholder:text-stone-500 focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 focus:outline-none"
             />
           </label>
           <button
             type="submit"
             disabled={adding || !addValue.trim()}
-            className="w-fit rounded-lg bg-stone-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
+            className="w-fit rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-700 disabled:opacity-60"
           >
             {adding ? "Saving…" : "Add field"}
           </button>
@@ -324,11 +329,13 @@ function ProfileRow({
 }) {
   const [value, setValue] = useState(field.field_value);
   const [saving, setSaving] = useState(false);
+  const toast = useToast();
 
   async function save() {
     setSaving(true);
     try {
       onUpdated(await updateProfileField(field.id, value));
+      toast("Saved");
     } catch (failure) {
       onError(failure instanceof Error ? failure.message : "Could not update this field.");
     } finally {
@@ -341,6 +348,7 @@ function ProfileRow({
     try {
       await deleteProfileField(field.id);
       onDeleted(field.id);
+      toast("Removed from your profile");
     } catch (failure) {
       onError(failure instanceof Error ? failure.message : "Could not delete this field.");
     } finally {
@@ -355,9 +363,9 @@ function ProfileRow({
         <input
           value={value}
           onChange={(event) => setValue(event.target.value)}
-          className="w-full rounded-lg border border-stone-300 px-3 py-2"
+          className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 shadow-sm placeholder:text-stone-500 focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 focus:outline-none"
         />
-        <p className="mt-1 text-stone-500">
+        <p className="mt-1 text-stone-600">
           {field.verification_status === "imported"
             ? "Imported from a verified document"
             : "Entered manually"}
@@ -371,15 +379,15 @@ function ProfileRow({
             Open {field.source_filename}
           </button>
         ) : field.verification_status === "imported" ? (
-          <p className="mt-1 text-stone-500">Source document unavailable</p>
+          <p className="mt-1 text-stone-600">Source document unavailable</p>
         ) : null}
-        <div className="mt-2 flex gap-3">
-          <button type="button" disabled={saving} onClick={() => void save()} className="underline">
+        <div className="mt-2 flex gap-2">
+          <Button size="sm" variant="primary" disabled={saving} onClick={() => void save()}>
             {saving ? "Saving…" : "Save"}
-          </button>
-          <button type="button" disabled={saving} onClick={() => void remove()} className="underline">
+          </Button>
+          <Button size="sm" variant="danger" disabled={saving} onClick={() => void remove()}>
             Delete
-          </button>
+          </Button>
         </div>
       </div>
     </div>
@@ -401,12 +409,12 @@ function ConflictPanel({
 }) {
   return (
     <section className="rounded-xl border border-amber-300 bg-amber-50 p-4">
-      <h3 className="text-sm font-medium text-stone-900">
+      <h3 className="font-semibold text-stone-900">
         {fieldLabel(conflict.field_name)} has two values
       </h3>
       <div className="mt-3 grid gap-3 sm:grid-cols-2">
         <div>
-          <p className="text-xs uppercase tracking-wide text-stone-500">Current profile</p>
+          <p className="text-xs uppercase tracking-wide text-stone-600">Current profile</p>
           <p className="mt-1 text-sm text-stone-900">{conflict.existing_value}</p>
           <p className="text-sm text-stone-600">
             {conflict.existing_source_available
@@ -415,7 +423,7 @@ function ConflictPanel({
           </p>
         </div>
         <div>
-          <p className="text-xs uppercase tracking-wide text-stone-500">Proposed value</p>
+          <p className="text-xs uppercase tracking-wide text-stone-600">Proposed value</p>
           <p className="mt-1 text-sm text-stone-900">{conflict.proposed_value}</p>
           <p className="text-sm text-stone-600">
             {conflict.proposed_source_filename ?? "Entered manually"}
@@ -426,7 +434,7 @@ function ConflictPanel({
         <button type="button" disabled={resolving} onClick={onKeep} className="rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-sm">
           Keep existing value
         </button>
-        <button type="button" disabled={resolving} onClick={onReplace} className="rounded-lg bg-stone-900 px-3 py-1.5 text-sm text-white">
+        <button type="button" disabled={resolving} onClick={onReplace} className="rounded-lg bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-700">
           Replace with proposed value
         </button>
         <button type="button" disabled={resolving} onClick={onCancel} className="px-3 py-1.5 text-sm underline">

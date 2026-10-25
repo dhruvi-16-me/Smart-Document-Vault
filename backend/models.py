@@ -181,6 +181,23 @@ class ProfileResolveRequest(BaseModel):
     field_value: Optional[str] = None
 
 
+class UpcomingDate(BaseModel):
+    document_id: str
+    filename: str
+    document_label: Optional[str] = None
+    document_group: Optional[str] = None
+    field_label: str
+    date_role: str
+    date: str
+    days_left: int
+    page_number: Optional[int] = None
+    verified: bool
+
+
+class DashboardResponse(BaseModel):
+    upcoming: List[UpcomingDate]
+
+
 class SearchRequest(BaseModel):
     query: str
 
@@ -190,6 +207,7 @@ class SearchHit(BaseModel):
     filename: str
     document_type: Optional[str] = None
     document_label: Optional[str] = None
+    document_group: Optional[str] = None
     chunk_index: int
     page_number: Optional[int] = None
     text: str
@@ -225,6 +243,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: List[ChatMessage] = Field(default_factory=list)
+    document_id: Optional[str] = None  # limits the search to one document
 
     @field_validator("message")
     @classmethod
@@ -242,19 +261,3 @@ class ChatRequest(BaseModel):
         if len(value) > 8:
             raise ValueError("Conversation history is too long.")
         return value
-
-
-class ChatSource(BaseModel):
-    label: str
-    document_id: str
-    filename: str
-    page_number: Optional[int] = None
-    chunk_id: int
-    snippet: str
-    score: float
-
-
-class ChatResponse(BaseModel):
-    answer: str
-    sources: List[ChatSource]
-    status: str

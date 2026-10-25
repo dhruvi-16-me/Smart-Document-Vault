@@ -22,6 +22,7 @@ def run_search(query: str) -> SearchResponse:
                 filename=passage["filename"],
                 document_type=passage["document_type"],
                 document_label=passage["document_label"],
+                document_group=passage["document_group"],
                 chunk_index=passage["chunk_index"],
                 page_number=passage["page_number"],
                 text=passage["text"],

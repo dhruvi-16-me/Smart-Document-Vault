@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { UploadIcon } from "./icons.tsx";
 
 type UploadDropzoneProps = {
   onFileSelected: (file: File) => void;
@@ -7,19 +8,18 @@ type UploadDropzoneProps = {
   uploading?: boolean;
 };
 
-function chooseFile(
-  file: File | undefined,
+function chooseFiles(
+  files: FileList | null | undefined,
   onFileSelected: (file: File) => void,
   onReject?: (message: string) => void,
 ) {
-  if (!file) {
-    return;
+  for (const file of Array.from(files ?? [])) {
+    if (file.size === 0) {
+      onReject?.(`${file.name} is empty.`);
+    } else {
+      onFileSelected(file);
+    }
   }
-  if (file.size === 0) {
-    onReject?.("This file is empty.");
-    return;
-  }
-  onFileSelected(file);
 }
 
 export function UploadDropzone({
@@ -33,10 +33,10 @@ export function UploadDropzone({
 
   return (
     <label
-      className={`block rounded-xl border border-dashed px-6 py-10 text-center ${
+      className={`flex items-center gap-4 rounded-2xl border-2 border-dashed px-6 py-5 transition-colors ${
         dragging && !inactive
-          ? "border-stone-900 bg-stone-100"
-          : "border-stone-300 bg-white"
+          ? "border-brand-500 bg-brand-50"
+          : "border-stone-300 bg-white hover:border-brand-400 hover:bg-brand-50/40"
       } ${inactive ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
       onDragOver={(event) => {
         event.preventDefault();
@@ -48,28 +48,33 @@ export function UploadDropzone({
       onDrop={(event) => {
         event.preventDefault();
         setDragging(false);
-        if (inactive) {
-          return;
+        if (!inactive) {
+          chooseFiles(event.dataTransfer.files, onFileSelected, onReject);
         }
-        chooseFile(event.dataTransfer.files[0], onFileSelected, onReject);
       }}
     >
       <input
         type="file"
+        multiple
         className="sr-only"
         disabled={inactive}
         onChange={(event) => {
-          chooseFile(event.target.files?.[0], onFileSelected, onReject);
+          chooseFiles(event.target.files, onFileSelected, onReject);
           event.target.value = "";
         }}
       />
-      <span className="block text-sm font-medium text-stone-900">
-        {uploading ? "Uploading…" : "Drop any document here"}
+      <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-brand-50 text-brand-600">
+        <UploadIcon size={24} />
       </span>
-      <span className="mt-1 block text-sm text-stone-500">
-        {uploading
-          ? "Keep this page open"
-          : "PDFs, photos, scans, Word and text files are read. Other files are stored as they are."}
+      <span>
+        <span className="block font-medium text-stone-900">
+          {uploading ? "Uploading…" : "Drop files here, or click to choose"}
+        </span>
+        <span className="mt-0.5 block text-sm text-stone-600">
+          {uploading
+            ? "Keep this page open"
+            : "PDFs, photos, scans, Word and text files are read. Anything else is stored as it is."}
+        </span>
       </span>
     </label>
   );

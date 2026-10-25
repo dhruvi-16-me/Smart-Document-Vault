@@ -153,6 +153,63 @@ def run_field_extraction(document_id: str) -> None:
         connection.close()
 
 
+def retry_failed_steps(document_id: str, classify: bool, extract: bool, index: bool) -> None:
+    """Run again the steps that failed, for example while Ollama was not running.
+
+    The text is not read again, and a type the user set is never replaced.
+    """
+    connection = connect()
+    try:
+        row = connection.execute(
+            "SELECT filename, status, full_text FROM documents WHERE id = ?", (document_id,)
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None or row["status"] != "ready":
+        return
+    if classify:
+        try:
+            classification = classify_document(row["full_text"] or "", row["filename"])
+        except Exception as error:
+            classification = ClassificationOutcome(
+                reasoning=_public_message(error, "Could not classify this document."),
+                status="failed",
+            )
+        connection = connect()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE documents
+                    SET document_type = ?, document_label = ?, document_group = ?,
+                        classification_confidence = ?, classification_status = ?,
+                        classification_method = ?, classification_reasoning = ?
+                    WHERE id = ? AND classification_status != 'verified'
+                    """,
+                    (
+                        classification.document_type,
+                        classification.document_label,
+                        classification.document_group,
+                        classification.confidence,
+                        classification.status,
+                        classification.method,
+                        classification.reasoning,
+                        document_id,
+                    ),
+                )
+        finally:
+            connection.close()
+    if extract:
+        run_field_extraction(document_id)
+    if index:
+        from services.index import _mark_index_failed, index_document
+
+        try:
+            index_document(document_id)
+        except Exception:
+            _mark_index_failed(document_id, "Could not index this document.")
+
+
 def _mark_processing(document_id: str):
     connection = connect()
     try:

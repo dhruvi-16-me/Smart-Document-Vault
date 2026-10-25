@@ -3,7 +3,7 @@ import os
 import re
 import urllib.error
 import urllib.request
-from typing import List
+from typing import Iterator, List, Optional
 
 from database import connect
 from services.index import retrieve_passages
@@ -19,30 +19,73 @@ def max_context_chars() -> int:
     return max(500, int(os.environ.get("RAG_MAX_CONTEXT_CHARS", "6000")))
 
 
-def answer_question(question: str, history: list) -> dict:
-    """Answer from retrieved chunks. Retrieval failures are raised, not guessed around."""
-    if _indexed_chunk_count() == 0:
-        return _insufficient("No documents are indexed yet.")
+def stream_answer(
+    question: str, history: list, document_id: Optional[str] = None
+) -> Iterator[dict]:
+    """Yield a sources event, answer text as it is written, then a done event.
+
+    With document_id, only that document's passages are searched. Retrieval failures are
+    raised before the first event, not guessed around.
+    """
+    if _indexed_chunk_count(document_id) == 0:
+        message = _unsearchable_reason(document_id) if document_id else "No documents are indexed yet."
+        yield _done(message, "insufficient")
+        return
 
     retrieval_query = _retrieval_query(question, history)
-    passages = _select_passages(retrieve_passages(retrieval_query, limit=top_k()))
+    passages = _select_passages(
+        retrieve_passages(retrieval_query, limit=top_k(), document_id=document_id)
+    )
     if not passages:
-        return _insufficient("None of the indexed documents look relevant to that question.")
+        yield _done("None of the indexed documents look relevant to that question.", "insufficient")
+        return
 
-    answer = _generate(question, history, passages)
-    return {
-        "answer": answer,
-        "sources": _sources(passages),
-        "status": "answered",
-    }
+    yield {"type": "sources", "sources": _sources(passages)}
+    parts = []
+    for text in _stream_chat(_messages(question, history, passages)):
+        parts.append(text)
+        yield {"type": "token", "text": text}
+    yield _done(_public_answer("".join(parts)), "answered")
 
 
-def _indexed_chunk_count() -> int:
+def _indexed_chunk_count(document_id: Optional[str]) -> int:
     connection = connect()
     try:
-        return connection.execute("SELECT COUNT(*) AS count FROM chunks").fetchone()["count"]
+        if document_id:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM chunks WHERE document_id = ?", (document_id,)
+            ).fetchone()
+        else:
+            row = connection.execute("SELECT COUNT(*) AS count FROM chunks").fetchone()
+        return row["count"]
     finally:
         connection.close()
+
+
+def _unsearchable_reason(document_id: str) -> str:
+    connection = connect()
+    try:
+        row = connection.execute(
+            "SELECT status, full_text, index_status, index_error FROM documents WHERE id = ?",
+            (document_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        return "This document is no longer in the vault."
+    if row["status"] == "stored":
+        return "This file's contents cannot be read, so there is nothing to search in it."
+    if row["status"] in {"uploaded", "processing"} or row["index_status"] == "processing":
+        return "This document is still being read. Try again in a moment."
+    if row["index_status"] == "failed":
+        reason = row["index_error"] or "indexing failed"
+        return (
+            "This document has text but is not searchable yet ({}). Open it and choose "
+            "Try again.".format(reason.rstrip("."))
+        )
+    if not (row["full_text"] or "").strip():
+        return "No text could be read from this document, so there is nothing to search."
+    return "This document is not searchable yet. Open it and choose Try again."
 
 
 def _retrieval_query(question: str, history: list) -> str:
@@ -87,7 +130,7 @@ def _dedupe(passages: list) -> list:
     return kept
 
 
-def _generate(question: str, history: list, passages: list) -> str:
+def _messages(question: str, history: list, passages: list) -> List[dict]:
     messages = [{"role": "system", "content": _system_prompt()}]
     for item in history[-6:]:
         if item.get("role") in {"user", "assistant"} and item.get("content"):
@@ -100,7 +143,7 @@ def _generate(question: str, history: list, passages: list) -> str:
             "content": _user_prompt(question, passages),
         }
     )
-    return _request_chat(messages)
+    return messages
 
 
 def _system_prompt() -> str:
@@ -131,13 +174,13 @@ def _user_prompt(question: str, passages: list) -> str:
     )
 
 
-def _request_chat(messages: List[dict]) -> str:
+def _stream_chat(messages: List[dict]) -> Iterator[str]:
     host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
     model = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
     body = json.dumps(
         {
             "model": model,
-            "stream": False,
+            "stream": True,
             "messages": messages,
             "options": {"temperature": 0},
         }
@@ -149,8 +192,7 @@ def _request_chat(messages: List[dict]) -> str:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=CHAT_TIMEOUT_SECONDS) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        response = urllib.request.urlopen(request, timeout=CHAT_TIMEOUT_SECONDS)
     except urllib.error.HTTPError as error:
         if error.code == 404:
             raise ValueError("The Ollama model is not available.") from error
@@ -158,11 +200,22 @@ def _request_chat(messages: List[dict]) -> str:
     except Exception as error:
         raise ValueError("Ollama is not available.") from error
 
-    message = payload.get("message") if isinstance(payload, dict) else None
-    content = message.get("content") if isinstance(message, dict) else None
-    if not isinstance(content, str) or not content.strip():
+    wrote = False
+    with response:
+        for line in response:
+            try:
+                payload = json.loads(line.decode("utf-8"))
+            except ValueError as error:
+                raise ValueError("The model returned a malformed answer.") from error
+            message = payload.get("message") if isinstance(payload, dict) else None
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, str) and content:
+                wrote = True
+                yield content
+            if isinstance(payload, dict) and payload.get("done"):
+                break
+    if not wrote:
         raise ValueError("The model returned an empty answer.")
-    return _public_answer(content)
 
 
 def _public_answer(content: str) -> str:
@@ -189,5 +242,5 @@ def _sources(passages: list) -> list:
     return sources
 
 
-def _insufficient(message: str) -> dict:
-    return {"answer": message, "sources": [], "status": "insufficient"}
+def _done(answer: str, status: str) -> dict:
+    return {"type": "done", "answer": answer, "status": status}

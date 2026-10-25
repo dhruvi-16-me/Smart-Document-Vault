@@ -1,12 +1,18 @@
 import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import {
   getDocument,
   getDocumentFields,
   getDocumentOptions,
+  previewUrl,
+  retryDocument,
   retryFieldExtraction,
   updateDocument,
   updateDocumentField,
 } from "../api.ts";
+import { BackIcon, ChatIcon, FileIcon } from "../components/icons.tsx";
+import { Badge, Button, Card, GroupBadge, Notice, Skeleton, Spinner, inputClass } from "../components/ui.tsx";
+import { useToast } from "../toast.ts";
 import type {
   DocumentField,
   DocumentFieldsResponse,
@@ -14,16 +20,28 @@ import type {
   DocumentUpdate,
 } from "../types.ts";
 import {
-  DOCUMENT_STATUS_LABELS,
   READABLE_FORMATS_TEXT,
   fileTypeLabel,
+  groupColor,
   groupLabel,
+  statusBadge,
+  unfinishedSteps,
   type DocumentRecord,
 } from "../types.ts";
 
 type DocumentPageProps = {
-  documentId: string | null;
+  documentId: string;
+  focus: { page: number; at: number } | null;
+  onBack: () => void;
+  onAsk: () => void;
+  onLoaded: (document: DocumentRecord) => void;
 };
+
+type Tab = "fields" | "details" | "text";
+
+// The browser shows these as they are; the API converts the rest to page images.
+const NATIVE_IMAGES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const CONVERTED_IMAGES = new Set(["image/heic", "image/heif", "image/tiff"]);
 
 function isPending(document: DocumentRecord) {
   return document.status === "uploaded" || document.status === "processing";
@@ -36,22 +54,30 @@ function fieldsAreRunning(document: DocumentRecord) {
   );
 }
 
-export function DocumentPage({ documentId }: DocumentPageProps) {
-  if (!documentId) {
-    return (
-      <section className="space-y-2">
-        <h2 className="text-2xl font-semibold text-stone-900">Document</h2>
-        <p className="text-sm text-stone-600">Open a document from the vault.</p>
-      </section>
-    );
-  }
-
-  return <DocumentDetail key={documentId} documentId={documentId} />;
+function stepsAreRunning(document: DocumentRecord) {
+  return (
+    fieldsAreRunning(document) ||
+    document.classification_status === "processing" ||
+    document.index_status === "processing"
+  );
 }
 
-function DocumentDetail({ documentId }: { documentId: string }) {
+export function DocumentPage({ documentId, focus, onBack, onAsk, onLoaded }: DocumentPageProps) {
   const [document, setDocument] = useState<DocumentRecord | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [previewPage, setPreviewPage] = useState(focus?.page ?? 1);
+  const [tab, setTab] = useState<Tab>("fields");
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
+  // Bumped to restart polling after a retry starts.
+  const [reload, setReload] = useState(0);
+  const toast = useToast();
+
+  useEffect(() => {
+    if (focus) {
+      setPreviewPage(focus.page);
+    }
+  }, [focus]);
 
   useEffect(() => {
     let active = true;
@@ -64,7 +90,7 @@ function DocumentDetail({ documentId }: { documentId: string }) {
           return;
         }
         setDocument(record);
-        if (isPending(record) || (record.status === "ready" && fieldsAreRunning(record))) {
+        if (isPending(record) || (record.status === "ready" && stepsAreRunning(record))) {
           timer = window.setTimeout(() => {
             void load();
           }, 800);
@@ -81,86 +107,310 @@ function DocumentDetail({ documentId }: { documentId: string }) {
       active = false;
       window.clearTimeout(timer);
     };
-  }, [documentId]);
+  }, [documentId, reload]);
+
+  const loadedId = document?.id;
+  const loadedName = document?.filename;
+  useEffect(() => {
+    if (document && loadedId) {
+      onLoaded(document);
+    }
+    // Report once per loaded document, not on every poll.
+  }, [loadedId, loadedName]);
+
+  if (error) {
+    return (
+      <div className="space-y-4">
+        <BackButton onBack={onBack} />
+        <Notice tone="red">{error}</Notice>
+      </div>
+    );
+  }
+  if (!document) {
+    return (
+      <div className="space-y-6" aria-busy="true" aria-label="Loading document">
+        <Skeleton className="h-4 w-16" />
+        <Skeleton className="h-8 w-80" />
+        <div className="grid gap-6 lg:grid-cols-2">
+          <Skeleton className="h-[60vh]" />
+          <Skeleton className="h-[60vh]" />
+        </div>
+      </div>
+    );
+  }
+
+  const status = statusBadge(document);
+  const unfinished = unfinishedSteps(document);
+
+  async function retry() {
+    setRetrying(true);
+    setRetryError(null);
+    try {
+      setDocument(await retryDocument(documentId));
+      setReload((count) => count + 1);
+      toast("Trying the remaining steps again", "info");
+    } catch (failure) {
+      setRetryError(failure instanceof Error ? failure.message : "Could not start again.");
+    } finally {
+      setRetrying(false);
+    }
+  }
+  const activeTab: Tab = document.status === "ready" ? tab : tab === "fields" ? "details" : tab;
 
   return (
-    <section className="space-y-6">
-      <div>
-        <h2 className="text-2xl font-semibold text-stone-900">
-          {document?.filename ?? "Document"}
-        </h2>
-        <p className="mt-1 text-sm text-stone-600">
-          Type, tags, notes, extracted text, and fields for this document.
-        </p>
+    <div className="space-y-6">
+      <div className="space-y-3">
+        <BackButton onBack={onBack} />
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="truncate text-2xl font-semibold tracking-tight text-stone-900">
+              {document.filename}
+            </h1>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              {document.document_label ? <Badge tone="brand">{document.document_label}</Badge> : null}
+              {document.document_group ? (
+                <GroupBadge
+                  color={groupColor(document.document_group)}
+                  label={groupLabel(document.document_group) ?? document.document_group}
+                />
+              ) : null}
+              <Badge>{fileTypeLabel(document)}</Badge>
+              {document.page_count ? (
+                <Badge>
+                  {document.page_count} page{document.page_count === 1 ? "" : "s"}
+                </Badge>
+              ) : null}
+              {status ? (
+                <Badge tone={status.tone} status>
+                  {status.label}
+                </Badge>
+              ) : null}
+              {document.tags.map((tag) => (
+                <Badge key={tag} tone="blue">
+                  {tag}
+                </Badge>
+              ))}
+            </div>
+          </div>
+          <Button variant="primary" onClick={onAsk}>
+            <ChatIcon size={18} /> Ask about this document
+          </Button>
+        </div>
       </div>
-      {error ? <p className="text-sm text-red-700">{error}</p> : null}
-      {!document && !error ? (
-        <p className="text-sm text-stone-500">Loading document…</p>
+
+      {isPending(document) ? (
+        <Notice tone="brand">
+          <Spinner label="Reading this document. Text, type, and fields will appear in a moment." />
+        </Notice>
       ) : null}
-      {document ? (
-        <>
-          <dl className="grid gap-4 rounded-xl border border-stone-200 bg-white p-4 sm:grid-cols-4">
-            <div>
-              <dt className="text-xs uppercase tracking-wide text-stone-500">File type</dt>
-              <dd className="mt-1 text-sm text-stone-900">
-                {fileTypeLabel(document)}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-xs uppercase tracking-wide text-stone-500">Status</dt>
-              <dd className="mt-1 text-sm text-stone-900">
-                {DOCUMENT_STATUS_LABELS[document.status] ?? document.status}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-xs uppercase tracking-wide text-stone-500">Page count</dt>
-              <dd className="mt-1 text-sm text-stone-900">
-                {document.page_count === null ? "—" : document.page_count}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-xs uppercase tracking-wide text-stone-500">OCR confidence</dt>
-              <dd className="mt-1 text-sm text-stone-900">
-                {document.ocr_confidence === null ? "—" : `${Math.round(document.ocr_confidence)}%`}
-              </dd>
-            </div>
-          </dl>
-          {document.low_confidence_pages.length > 0 ? (
-            <p className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-              Text was hard to read on {pageList(document.low_confidence_pages)}. Check values from{" "}
-              {document.low_confidence_pages.length === 1 ? "that page" : "those pages"} against the
-              original.
+      {document.status === "failed" ? (
+        <Notice tone="red">{document.error_message || "Could not read text from this document."}</Notice>
+      ) : null}
+      {document.status === "stored" ? (
+        <Notice tone="amber">
+          {document.error_message || "This file is stored in the vault, but its contents cannot be read."}{" "}
+          Text is read from {READABLE_FORMATS_TEXT}. You can still set a type, tags, and notes.
+        </Notice>
+      ) : null}
+      {unfinished.length > 0 ? (
+        <Notice tone="amber">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p>
+              The text was read, but last time the app could not {joinSteps(unfinished)}
+              {document.index_error
+                ? ` because of this error: "${document.index_error.replace(/\.$/, "")}"`
+                : ""}
+              . If Ollama is running now, click Try again.
             </p>
-          ) : null}
-          {!isPending(document) ? (
-            <DetailsPanel
-              key={[
-                document.id,
-                document.document_type,
-                document.document_label,
-                document.document_group,
-                document.notes,
-                ...document.tags,
-              ].join("|")}
-              document={document}
-              onUpdated={setDocument}
-            />
-          ) : null}
-          <ExtractedText document={document} />
-          {document.status === "ready" ? (
-            <ExtractedFields
-              key={`${document.id}-${document.field_extraction_status}-${document.document_type}`}
-              document={document}
-              onDocumentUpdated={setDocument}
-            />
-          ) : null}
-        </>
+            <Button size="sm" variant="primary" disabled={retrying} onClick={() => void retry()}>
+              {retrying ? "Starting…" : "Try again"}
+            </Button>
+          </div>
+          {retryError ? <p className="mt-2 text-red-700">{retryError}</p> : null}
+        </Notice>
       ) : null}
-    </section>
+      {document.status === "ready" && stepsAreRunning(document) && !fieldsAreRunning(document) ? (
+        <Notice tone="brand">
+          <Spinner label="Finishing the remaining steps…" />
+        </Notice>
+      ) : null}
+      {document.low_confidence_pages.length > 0 ? (
+        <Notice tone="amber">
+          Text was hard to read on {pageList(document.low_confidence_pages)}. Check values from{" "}
+          {document.low_confidence_pages.length === 1 ? "that page" : "those pages"} against the
+          original.
+        </Notice>
+      ) : null}
+
+      <div className="grid items-start gap-6 lg:grid-cols-2">
+        <div className="lg:sticky lg:top-0">
+          <Preview document={document} page={previewPage} onPageChange={setPreviewPage} />
+        </div>
+        <Card className="p-0">
+          <div className="flex gap-1 border-b border-stone-200 px-3 pt-3" role="tablist">
+            {document.status === "ready" ? (
+              <TabButton active={activeTab === "fields"} onClick={() => setTab("fields")}>
+                Fields
+              </TabButton>
+            ) : null}
+            <TabButton active={activeTab === "details"} onClick={() => setTab("details")}>
+              Details
+            </TabButton>
+            {document.full_text ? (
+              <TabButton active={activeTab === "text"} onClick={() => setTab("text")}>
+                Text
+              </TabButton>
+            ) : null}
+          </div>
+          <div className="p-5">
+            {activeTab === "fields" ? (
+              <ExtractedFields
+                key={`${document.id}-${document.field_extraction_status}-${document.document_type}`}
+                document={document}
+                onDocumentUpdated={setDocument}
+                onShowPage={setPreviewPage}
+              />
+            ) : null}
+            {activeTab === "details" && !isPending(document) ? (
+              <DetailsPanel
+                key={[
+                  document.id,
+                  document.document_type,
+                  document.document_label,
+                  document.document_group,
+                  document.notes,
+                  ...document.tags,
+                ].join("|")}
+                document={document}
+                onUpdated={setDocument}
+              />
+            ) : null}
+            {activeTab === "text" ? (
+              <pre className="max-h-[70vh] overflow-y-auto font-sans text-sm leading-relaxed whitespace-pre-wrap text-stone-700">
+                {document.full_text}
+              </pre>
+            ) : null}
+          </div>
+        </Card>
+      </div>
+    </div>
   );
 }
 
-const STATUS_LABELS: Record<string, string> = {
+function joinSteps(steps: string[]) {
+  return steps.length <= 1 ? steps.join("") : `${steps.slice(0, -1).join(", ")} or ${steps[steps.length - 1]}`;
+}
+
+function BackButton({ onBack }: { onBack: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onBack}
+      className="inline-flex items-center gap-1 text-sm font-medium text-stone-600 hover:text-brand-700"
+    >
+      <BackIcon size={16} /> Vault
+    </button>
+  );
+}
+
+function TabButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={active}
+      onClick={onClick}
+      className={`-mb-px border-b-2 px-4 py-2.5 text-sm font-medium transition-colors ${
+        active
+          ? "border-brand-600 text-brand-700"
+          : "border-transparent text-stone-600 hover:text-stone-800"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Preview({
+  document,
+  page,
+  onPageChange,
+}: {
+  document: DocumentRecord;
+  page: number;
+  onPageChange: (page: number) => void;
+}) {
+  const [failed, setFailed] = useState(false);
+  const pages = document.page_count ?? 1;
+  const frame = "overflow-hidden rounded-2xl border border-stone-200 bg-stone-100 shadow-sm";
+
+  if (document.media_type === "application/pdf" && !failed) {
+    return (
+      <iframe
+        // A new key reloads the viewer, which is how it jumps to a page.
+        key={page}
+        title={`Preview of ${document.filename}`}
+        src={`${previewUrl(document.id)}#page=${page}&view=FitH`}
+        className={`${frame} h-[78vh] w-full`}
+      />
+    );
+  }
+
+  const native = NATIVE_IMAGES.has(document.media_type);
+  const converted = CONVERTED_IMAGES.has(document.media_type);
+  if ((native || converted) && !failed) {
+    const shown = converted ? Math.min(page, pages) : 1;
+    return (
+      <div className={frame}>
+        <img
+          src={previewUrl(document.id, shown)}
+          alt={`Page ${shown} of ${document.filename}`}
+          onError={() => setFailed(true)}
+          className="max-h-[72vh] w-full bg-white object-contain"
+        />
+        {converted && pages > 1 ? (
+          <div className="flex items-center justify-between border-t border-stone-200 bg-white px-3 py-2 text-sm">
+            <Button size="sm" variant="ghost" disabled={shown <= 1} onClick={() => onPageChange(shown - 1)}>
+              Previous
+            </Button>
+            <span className="text-stone-600">
+              Page {shown} of {pages}
+            </span>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={shown >= pages}
+              onClick={() => onPageChange(shown + 1)}
+            >
+              Next
+            </Button>
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  return (
+    <div className={`${frame} flex min-h-80 flex-col items-center justify-center bg-white p-8 text-center`}>
+      <FileIcon size={40} className="text-stone-300" />
+      <p className="mt-3 font-medium text-stone-700">No picture preview for this file</p>
+      <p className="mt-1 text-sm text-stone-600">
+        {document.full_text ? "Its text is in the Text tab." : "It is kept in the vault as it is."}
+      </p>
+    </div>
+  );
+}
+
+const CLASSIFICATION_STATUS: Record<string, string> = {
+  processing: "Identifying…",
   predicted: "Predicted",
   needs_review: "Needs review",
   failed: "Classification failed",
@@ -194,6 +444,7 @@ function DetailsPanel({
   const [notes, setNotes] = useState(document.notes ?? "");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const toast = useToast();
 
   useEffect(() => {
     let active = true;
@@ -241,6 +492,7 @@ function DetailsPanel({
     setSaveError(null);
     try {
       onUpdated(await updateDocument(document.id, update));
+      toast("Details saved");
     } catch (saveFailure) {
       setSaveError(
         saveFailure instanceof Error ? saveFailure.message : "Could not save these details.",
@@ -251,55 +503,42 @@ function DetailsPanel({
   }
 
   return (
-    <section className="rounded-xl border border-stone-200 bg-white p-4">
-      <h3 className="text-sm font-medium text-stone-900">Details</h3>
-      <dl className="mt-3 grid gap-4 border-t border-stone-200 pt-3 sm:grid-cols-4">
-        <div>
-          <dt className="text-xs uppercase tracking-wide text-stone-500">Document type</dt>
-          <dd className="mt-1 text-sm text-stone-900">{document.document_label ?? "—"}</dd>
-        </div>
-        <div>
-          <dt className="text-xs uppercase tracking-wide text-stone-500">Group</dt>
-          <dd className="mt-1 text-sm text-stone-900">
-            {groupLabel(document.document_group) ?? "—"}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-xs uppercase tracking-wide text-stone-500">Decided by</dt>
-          <dd className="mt-1 text-sm text-stone-900">
-            {METHOD_LABELS[document.classification_method ?? ""] ?? "—"}
-          </dd>
+    <div className="space-y-5">
+      <dl className="grid grid-cols-2 gap-4 text-sm">
+        <Fact label="Identified by">
+          {METHOD_LABELS[document.classification_method ?? ""] ?? "—"}
           {document.classification_confidence !== null ? (
-            <p className="mt-1 text-xs text-stone-500">
-              Confidence {document.classification_confidence.toFixed(2)} (uncalibrated)
-            </p>
+            <span className="block text-xs text-stone-600">
+              Confidence {Math.round(document.classification_confidence * 100)}% (estimate)
+            </span>
           ) : null}
-        </div>
-        <div>
-          <dt className="text-xs uppercase tracking-wide text-stone-500">Status</dt>
-          <dd className="mt-1 text-sm text-stone-900">
-            {STATUS_LABELS[document.classification_status ?? ""] ?? "—"}
-          </dd>
-        </div>
+        </Fact>
+        <Fact label="Status">{CLASSIFICATION_STATUS[document.classification_status ?? ""] ?? "—"}</Fact>
+        <Fact label="OCR confidence">
+          {document.ocr_confidence === null ? "Not scanned" : `${Math.round(document.ocr_confidence)}%`}
+        </Fact>
+        <Fact label="Added">{new Date(`${document.created_at.replace(" ", "T")}Z`).toLocaleDateString()}</Fact>
       </dl>
       {document.classification_reasoning ? (
-        <p className="mt-3 text-sm text-stone-700">{document.classification_reasoning}</p>
+        <p className="rounded-lg bg-stone-50 px-3 py-2 text-sm text-stone-600">
+          {document.classification_reasoning}
+        </p>
       ) : null}
       <form
-        className="mt-4 grid gap-3 border-t border-stone-200 pt-4 sm:grid-cols-2"
+        className="grid gap-4 border-t border-stone-200 pt-5 sm:grid-cols-2"
         onSubmit={(event) => {
           event.preventDefault();
           void save();
         }}
       >
-        <label className="grid gap-1 text-sm">
-          <span className="font-medium text-stone-800">Document type</span>
+        <label className="grid gap-1.5 text-sm">
+          <span className="font-medium text-stone-700">Document type</span>
           <input
             value={typeLabel}
             list="document-type-options"
             onChange={(event) => changeType(event.target.value)}
             placeholder="For example: Rent agreement"
-            className="rounded-lg border border-stone-300 px-3 py-2"
+            className={inputClass}
           />
           <datalist id="document-type-options">
             {options?.types.map((option) => (
@@ -307,13 +546,9 @@ function DetailsPanel({
             ))}
           </datalist>
         </label>
-        <label className="grid gap-1 text-sm">
-          <span className="font-medium text-stone-800">Group</span>
-          <select
-            value={group}
-            onChange={(event) => setGroup(event.target.value)}
-            className="rounded-lg border border-stone-300 bg-white px-3 py-2"
-          >
+        <label className="grid gap-1.5 text-sm">
+          <span className="font-medium text-stone-700">Group</span>
+          <select value={group} onChange={(event) => setGroup(event.target.value)} className={inputClass}>
             <option value="" disabled>
               Choose a group
             </option>
@@ -324,45 +559,48 @@ function DetailsPanel({
             ))}
           </select>
         </label>
-        <label className="grid gap-1 text-sm sm:col-span-2">
-          <span className="font-medium text-stone-800">Tags</span>
+        <label className="grid gap-1.5 text-sm sm:col-span-2">
+          <span className="font-medium text-stone-700">Tags</span>
           <input
             value={tags}
             onChange={(event) => setTags(event.target.value)}
             placeholder="Separate tags with commas"
-            className="rounded-lg border border-stone-300 px-3 py-2"
+            className={inputClass}
           />
           {options && options.tags.length > 0 ? (
-            <span className="text-xs text-stone-500">In use: {options.tags.join(", ")}</span>
+            <span className="text-xs text-stone-600">In use: {options.tags.join(", ")}</span>
           ) : null}
         </label>
-        <label className="grid gap-1 text-sm sm:col-span-2">
-          <span className="font-medium text-stone-800">Notes</span>
+        <label className="grid gap-1.5 text-sm sm:col-span-2">
+          <span className="font-medium text-stone-700">Notes</span>
           <textarea
             value={notes}
             onChange={(event) => setNotes(event.target.value)}
             rows={3}
             maxLength={2000}
-            className="rounded-lg border border-stone-300 px-3 py-2"
+            className={inputClass}
           />
         </label>
-        <div className="flex items-center gap-3 sm:col-span-2">
-          <button
-            type="submit"
-            disabled={!changed || saving}
-            className="rounded-lg bg-stone-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
-          >
+        <div className="flex flex-wrap items-center gap-3 sm:col-span-2">
+          <Button type="submit" variant="primary" disabled={!changed || saving}>
             {saving ? "Saving…" : "Save details"}
-          </button>
+          </Button>
           {update.document_type && document.status === "ready" ? (
-            <span className="text-xs text-stone-500">
-              Changing the type extracts fields again.
-            </span>
+            <span className="text-xs text-stone-600">Changing the type reads the fields again.</span>
           ) : null}
         </div>
       </form>
-      {saveError ? <p className="mt-2 text-sm text-red-700">{saveError}</p> : null}
-    </section>
+      {saveError ? <p className="text-sm text-red-700">{saveError}</p> : null}
+    </div>
+  );
+}
+
+function Fact({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div>
+      <dt className="text-xs font-medium tracking-wide text-stone-600 uppercase">{label}</dt>
+      <dd className="mt-1 text-stone-900">{children}</dd>
+    </div>
   );
 }
 
@@ -384,7 +622,6 @@ function fieldDetails(field: DocumentField) {
     field.kind ? (KIND_LABELS[field.kind] ?? field.kind) : null,
     field.date_role,
     field.normalized_value,
-    field.page_number === null ? null : `Page ${field.page_number}`,
   ].filter((item): item is string => Boolean(item));
 }
 
@@ -393,17 +630,15 @@ function pageList(pages: number[]) {
 }
 
 const FIELD_LABELS: Record<string, string> = {
-  fathers_name: "Father's Name",
-  mothers_name: "Mother's Name",
+  fathers_name: "Father's name",
+  mothers_name: "Mother's name",
   cgpa: "CGPA",
-  pan_number: "PAN Number",
+  pan_number: "PAN number",
 };
 
 function fieldLabel(name: string) {
-  return (
-    FIELD_LABELS[name] ??
-    name.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase())
-  );
+  const words = name.replaceAll("_", " ");
+  return FIELD_LABELS[name] ?? words.charAt(0).toUpperCase() + words.slice(1);
 }
 
 function displayValue(value: string) {
@@ -432,13 +667,16 @@ function displayValue(value: string) {
 function ExtractedFields({
   document,
   onDocumentUpdated,
+  onShowPage,
 }: {
   document: DocumentRecord;
   onDocumentUpdated: (document: DocumentRecord) => void;
+  onShowPage: (page: number) => void;
 }) {
   const [payload, setPayload] = useState<DocumentFieldsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
+  const toast = useToast();
 
   useEffect(() => {
     if (fieldsAreRunning(document)) {
@@ -466,6 +704,7 @@ function ExtractedFields({
     setError(null);
     try {
       onDocumentUpdated(await retryFieldExtraction(document.id));
+      toast("Reading the fields again", "info");
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Could not retry field extraction.");
     } finally {
@@ -475,13 +714,14 @@ function ExtractedFields({
 
   const status = document.field_extraction_status;
   const fields = payload?.fields ?? [];
-  const stored = new Map(fields.map((field) => [field.field_name, field]));
   const names = payload?.expected_fields ?? [];
-  // Template fields first (missing ones included), then any other labelled values.
-  const rows: (DocumentField | string)[] = [
-    ...names.map((name) => stored.get(name) ?? name),
+  const found = new Set(fields.map((field) => field.field_name));
+  // Template fields first, in template order, then any other labelled values.
+  const ordered = [
+    ...names.flatMap((name) => fields.filter((field) => field.field_name === name)),
     ...fields.filter((field) => !names.includes(field.field_name)),
   ];
+  const missing = names.filter((name) => !found.has(name));
   const updateField = (updated: DocumentField) => {
     setPayload((current) =>
       current
@@ -494,81 +734,62 @@ function ExtractedFields({
   };
 
   return (
-    <section className="rounded-xl border border-stone-200 bg-white p-4">
+    <div>
       <div className="flex items-center justify-between gap-3">
-        <h3 className="text-sm font-medium text-stone-900">Extracted Fields</h3>
+        <p className="text-sm text-stone-600">
+          {status === "completed"
+            ? `${ordered.length} value${ordered.length === 1 ? "" : "s"} found. Check each one against the document, then verify it.`
+            : "Values read from this document."}
+        </p>
         {status === "failed" || status === "completed" ? (
-          <button
-            type="button"
-            disabled={retrying}
-            onClick={() => {
-              void retry();
-            }}
-            className="rounded-lg border border-stone-300 px-3 py-1 text-sm text-stone-800"
-          >
-            {retrying ? "Starting…" : status === "failed" ? "Retry extraction" : "Extract again"}
-          </button>
+          <Button size="sm" disabled={retrying} onClick={() => void retry()}>
+            {retrying ? "Starting…" : status === "failed" ? "Try again" : "Read again"}
+          </Button>
         ) : null}
       </div>
-      {error ? <p className="mt-2 text-sm text-red-700">{error}</p> : null}
+      {error ? <p className="mt-3 text-sm text-red-700">{error}</p> : null}
       {fieldsAreRunning(document) ? (
-        <p className="mt-3 text-sm text-stone-600">Extracting fields…</p>
+        <div className="mt-4">
+          <Spinner label="Reading fields…" />
+        </div>
       ) : null}
       {status === "needs_review" ? (
-        <p className="mt-3 text-sm text-stone-600">
+        <p className="mt-4 text-sm text-stone-600">
           {document.document_type
-            ? "Not enough text to extract fields."
-            : "Confirm the document type before fields can be extracted."}
+            ? "There is not enough text to read fields."
+            : "Set the document type in Details before fields can be read."}
         </p>
       ) : null}
       {status === "failed" ? (
-        <p className="mt-3 text-sm text-red-700">
-          {document.field_extraction_error || "Field extraction failed."}
-        </p>
-      ) : null}
-      {status === "completed" && rows.length === 0 ? (
-        <p className="mt-3 text-sm text-stone-600">No labelled values were found.</p>
-      ) : null}
-      {status === "completed" && rows.length > 0 ? (
-        <div className="mt-3 overflow-x-auto border-t border-stone-200 pt-3">
-          <table className="w-full text-left text-sm">
-            <thead>
-              <tr className="text-xs uppercase tracking-wide text-stone-500">
-                <th className="py-2 pr-3 font-medium">Field</th>
-                <th className="py-2 pr-3 font-medium">Value</th>
-                <th className="py-2 pr-3 font-medium">Details</th>
-                <th className="py-2 pr-3 font-medium">Status</th>
-                <th className="py-2 font-medium">Source</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) =>
-                typeof row === "string" ? (
-                  <tr key={row} className="border-t border-stone-100">
-                    <td className="py-2 pr-3 text-stone-800">{fieldLabel(row)}</td>
-                    <td className="py-2 pr-3 text-stone-400">Missing</td>
-                    <td className="py-2 pr-3 text-stone-400">—</td>
-                    <td className="py-2 pr-3 text-stone-400">Not extracted</td>
-                    <td className="py-2 text-stone-400">—</td>
-                  </tr>
-                ) : (
-                  <FieldRow
-                    key={row.id}
-                    documentId={document.id}
-                    field={row}
-                    lowConfidence={
-                      row.page_number !== null &&
-                      document.low_confidence_pages.includes(row.page_number)
-                    }
-                    onUpdated={updateField}
-                  />
-                ),
-              )}
-            </tbody>
-          </table>
+        <div className="mt-4">
+          <Notice tone="red">{document.field_extraction_error || "Field extraction failed."}</Notice>
         </div>
       ) : null}
-    </section>
+      {status === "completed" && ordered.length === 0 ? (
+        <p className="mt-4 text-sm text-stone-600">No labelled values were found.</p>
+      ) : null}
+      {status === "completed" && ordered.length > 0 ? (
+        <ul className="mt-2 divide-y divide-stone-100">
+          {ordered.map((field) => (
+            <FieldRow
+              key={field.id}
+              documentId={document.id}
+              field={field}
+              lowConfidence={
+                field.page_number !== null && document.low_confidence_pages.includes(field.page_number)
+              }
+              onShowPage={onShowPage}
+              onUpdated={updateField}
+            />
+          ))}
+        </ul>
+      ) : null}
+      {status === "completed" && missing.length > 0 ? (
+        <p className="mt-4 rounded-lg bg-stone-50 px-3 py-2 text-sm text-stone-600">
+          Not found in this document: {missing.map(fieldLabel).join(", ")}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -576,23 +797,29 @@ function FieldRow({
   documentId,
   field,
   lowConfidence,
+  onShowPage,
   onUpdated,
 }: {
   documentId: string;
   field: DocumentField;
   lowConfidence: boolean;
+  onShowPage: (page: number) => void;
   onUpdated: (field: DocumentField) => void;
 }) {
-  const [value, setValue] = useState(displayValue(field.extracted_value));
+  const original = displayValue(field.extracted_value);
+  const [value, setValue] = useState(original);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const verified = field.verification_status === "verified";
+  const edited = value !== original;
+  const toast = useToast();
 
   async function save() {
     setSaving(true);
     setError(null);
     try {
       onUpdated(await updateDocumentField(documentId, field.id, value));
+      toast(edited ? "Saved and verified" : "Verified");
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Could not save this field.");
     } finally {
@@ -600,82 +827,55 @@ function FieldRow({
     }
   }
 
+  const details = fieldDetails(field);
   return (
-    <tr className="border-t border-stone-100 align-top">
-      <td className="py-2 pr-3 text-stone-800">{field.label ?? fieldLabel(field.field_name)}</td>
-      <td className="py-2 pr-3">
+    <li className="py-4">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="font-medium text-stone-900">{field.label ?? fieldLabel(field.field_name)}</p>
+          {details.length > 0 ? <p className="text-xs text-stone-600">{details.join(" · ")}</p> : null}
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {lowConfidence ? <Badge tone="amber">Hard-to-read page</Badge> : null}
+          {verified ? <Badge tone="green">Verified</Badge> : <Badge>AI read</Badge>}
+          {field.page_number !== null ? (
+            <button
+              type="button"
+              onClick={() => onShowPage(field.page_number as number)}
+              className="rounded-full px-2 py-0.5 text-xs font-medium text-brand-700 hover:bg-brand-50"
+              title="Show this page"
+            >
+              Page {field.page_number}
+            </button>
+          ) : null}
+        </div>
+      </div>
+      <div className="mt-2 flex gap-2">
+        <label className="sr-only" htmlFor={`field-${field.id}`}>
+          {field.label ?? fieldLabel(field.field_name)}
+        </label>
         <input
+          id={`field-${field.id}`}
           value={value}
           onChange={(event) => setValue(event.target.value)}
-          className="w-full rounded-lg border border-stone-300 px-2 py-1"
+          className={inputClass}
         />
-        <button
-          type="button"
-          disabled={saving}
-          onClick={() => {
-            void save();
-          }}
-          className="mt-1 text-xs text-stone-700 underline"
+        <Button
+          size="sm"
+          variant={verified && !edited ? "secondary" : "primary"}
+          disabled={saving || (verified && !edited)}
+          onClick={() => void save()}
+          className="shrink-0"
         >
-          {saving ? "Saving…" : "Save and verify"}
-        </button>
-        {error ? <p className="mt-1 text-xs text-red-700">{error}</p> : null}
-      </td>
-      <td className="py-2 pr-3 text-xs text-stone-600">
-        {fieldDetails(field).join(" · ") || "—"}
-        {lowConfidence ? (
-          <span className="mt-1 block text-amber-800">Hard-to-read page</span>
-        ) : null}
-      </td>
-      <td className="py-2 pr-3 text-stone-700">
-        {verified ? "Verified by you" : "AI extracted"}
-      </td>
-      <td className="py-2 text-stone-600">{field.source_text || "—"}</td>
-    </tr>
-  );
-}
-
-function ExtractedText({ document }: { document: DocumentRecord }) {
-  if (isPending(document)) {
-    return <p className="text-sm text-stone-600">Processing document...</p>;
-  }
-
-  if (document.status === "failed") {
-    return (
-      <p className="text-sm text-red-700">
-        {document.error_message || "Could not read text from this document."}
-      </p>
-    );
-  }
-
-  if (document.status === "stored") {
-    return (
-      <section className="rounded-xl border border-stone-200 bg-white p-4 text-sm text-stone-700">
-        <p>
-          {document.error_message ||
-            "This file is stored in the vault, but its contents cannot be read."}
+          {saving ? "Saving…" : edited ? "Save" : verified ? "Verified" : "Verify"}
+        </Button>
+      </div>
+      {field.source_text ? (
+        <p className="mt-2 border-l-2 border-stone-200 pl-3 text-xs text-stone-600 italic">
+          “{field.source_text}”
         </p>
-        <p className="mt-2 text-stone-500">
-          Text is read from {READABLE_FORMATS_TEXT}. You can still set a type, tags, and notes.
-        </p>
-      </section>
-    );
-  }
-
-  if (!document.full_text) {
-    return (
-      <p className="text-sm text-stone-600">
-        No text could be extracted from this document.
-      </p>
-    );
-  }
-
-  return (
-    <section className="rounded-xl border border-stone-200 bg-white p-4">
-      <h3 className="text-sm font-medium text-stone-900">Extracted Text</h3>
-      <pre className="mt-3 whitespace-pre-wrap border-t border-stone-200 pt-3 font-sans text-sm text-stone-800">
-        {document.full_text}
-      </pre>
-    </section>
+      ) : null}
+      {error ? <p className="mt-1 text-xs text-red-700">{error}</p> : null}
+    </li>
   );
 }

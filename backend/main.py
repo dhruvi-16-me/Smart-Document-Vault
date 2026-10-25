@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from database import init_db
 from models import HealthResponse
-from routers import chat, documents, profile, search
+from routers import chat, dashboard, documents, profile, search
 
 
 @asynccontextmanager
@@ -36,3 +36,4 @@ app.include_router(documents.router)
 app.include_router(profile.router)
 app.include_router(search.router)
 app.include_router(chat.router)
+app.include_router(dashboard.router)

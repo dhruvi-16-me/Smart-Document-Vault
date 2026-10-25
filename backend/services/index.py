@@ -67,8 +67,11 @@ def remove_document_vectors(document_id: str) -> None:
     _remove_ids([row["id"] for row in rows])
 
 
-def search_vectors(vector: list, limit: int = 8) -> list:
-    """Return chunk ids and similarity scores closest to a query vector."""
+def search_vectors(vector: list, limit: int = 8, chunk_ids: Optional[List[int]] = None) -> list:
+    """Return chunk ids and similarity scores closest to a query vector.
+
+    With chunk_ids, only those chunks are scored, exactly, however large the index is.
+    """
     if not vector:
         return []
     with _LOCK:
@@ -77,6 +80,8 @@ def search_vectors(vector: list, limit: int = 8) -> list:
             return []
         _require_compatible(meta, len(vector))
         query = _normalize(np.asarray([vector], dtype="float32"))
+        if chunk_ids is not None:
+            return _score_chunks(index, query[0], chunk_ids, limit)
         scores, ids = index.search(query, min(limit, index.ntotal))
     hits = []
     for score, chunk_id in zip(scores[0], ids[0]):
@@ -86,10 +91,16 @@ def search_vectors(vector: list, limit: int = 8) -> list:
     return hits
 
 
-def retrieve_passages(query: str, limit: int = 8) -> list:
-    """Embed a query, search FAISS, and load the matching chunks from SQLite."""
+def retrieve_passages(query: str, limit: int = 8, document_id: Optional[str] = None) -> list:
+    """Embed a query, search FAISS, and load the matching chunks from SQLite.
+
+    With document_id, only that document's chunks are searched.
+    """
+    chunk_ids = _document_chunk_ids(document_id) if document_id else None
+    if chunk_ids == []:
+        return []
     vector = embed_texts([query])[0]
-    hits = search_vectors(vector, limit=limit)
+    hits = search_vectors(vector, limit=limit, chunk_ids=chunk_ids)
     if not hits:
         return []
     connection = connect()
@@ -100,7 +111,7 @@ def retrieve_passages(query: str, limit: int = 8) -> list:
                 """
                 SELECT chunks.id, chunks.chunk_index, chunks.page_number, chunks.text,
                        documents.id AS document_id, documents.filename, documents.document_type,
-                       documents.document_label
+                       documents.document_label, documents.document_group
                 FROM chunks
                 JOIN documents ON documents.id = chunks.document_id
                 WHERE chunks.id = ?
@@ -119,6 +130,7 @@ def retrieve_passages(query: str, limit: int = 8) -> list:
                     "filename": row["filename"],
                     "document_type": row["document_type"],
                     "document_label": row["document_label"],
+                    "document_group": row["document_group"],
                     "score": round(float(hit["score"]), 4),
                 }
             )
@@ -186,6 +198,28 @@ def _remove_document_chunks(document_id: str) -> None:
             connection.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
     finally:
         connection.close()
+
+
+def _document_chunk_ids(document_id: str) -> List[int]:
+    connection = connect()
+    try:
+        rows = connection.execute(
+            "SELECT id FROM chunks WHERE document_id = ?", (document_id,)
+        ).fetchall()
+    finally:
+        connection.close()
+    return [row["id"] for row in rows]
+
+
+def _score_chunks(index, query: np.ndarray, chunk_ids: List[int], limit: int) -> list:
+    present = _indexed_ids(index)
+    ids = [chunk_id for chunk_id in chunk_ids if chunk_id in present]
+    if not ids:
+        return []
+    matrix = np.vstack([index.reconstruct(chunk_id) for chunk_id in ids])
+    scores = matrix @ query
+    order = np.argsort(-scores)[:limit]
+    return [{"chunk_id": ids[i], "score": float(scores[i])} for i in order]
 
 
 def _vectors_present(chunk_ids: List[int]) -> bool:
