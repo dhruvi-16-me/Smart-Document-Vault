@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Secrets
+.env
+.env.*
+
+# Local vault data and generated search indexes
+backend/data/
+*.faiss
+
+# Build output
+dist/
+dist-ssr/
+build/
+
+# Logs and local tooling
+logs
+*.log
+*.local
+.DS_Store
